@@ -1,0 +1,36 @@
+[package]
+name = "deloxy-core"
+version = "0.1.0"
+edition = "2021"
+description = "Deloxy - bare-metal x86_64 kernel"
+
+[[bin]]
+name = "deloxy-core"
+path = "src/main.rs"
+
+[dependencies]
+limine = "0.5"
+x86_64 = "0.15"
+spin = "0.9"
+log = { version = "0.4", default-features = false }
+libm = { version = "=0.2.8", default-features = false }
+smoltcp = { version = "=0.11.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-icmp"] }
+ed25519-compact = { version = "2", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[features]
+selftest = []
+test-pf = ["selftest"]
+net-test = ["selftest"]
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false

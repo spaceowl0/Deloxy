@@ -1,0 +1,5 @@
+src/gfx/font.rs is derived from DejaVu Sans Mono (c) Bitstream, Inc. / Tavmjong Bah - distributed under the
+Bitstream Vera / DejaVu fonts licence (permits use, copying and embedding with this notice).
+third_party/limine/: Limine bootloader v8.x binaries and host tool source, BSD-2-Clause (third_party/limine/LICENSE).
+vendor/: Rust crates under their own licences (MIT/Apache-2.0/BSD; see each crate's LICENSE files): spin, bitflags, log, x86_64, limine,
+smoltcp (0BSD), ed25519-compact (MIT), sha2 (MIT/Apache-2.0) and their dependencies.
