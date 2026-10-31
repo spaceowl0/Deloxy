@@ -1,0 +1,8 @@
+LIBRARY mathdll
+EXPORTS
+  math_add
+  math_base_plus
+  math_calls
+  math_counter DATA
+  math_sleep = KERNEL32.Sleep
+  math_ordinal_only @7 NONAME
