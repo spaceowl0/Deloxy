@@ -92,7 +92,7 @@ try:
     BASE = npackets()
     if UEFI:
         print("note: %d packets sent by the UEFI firmware before the kernel started are excluded" % BASE)
-    check("kernel loaded the initramfs module", "initramfs: 18 file(s)" in text())
+    check("kernel loaded the initramfs module", "initramfs: 56 file(s)" in text())
     run("help", ["builtins:", "upd check"])
     run("ls", ["deloxy-sh.elf", "hello_win.exe", "monitor.elf"])
     run("run hello_win.exe", ["Hello from Windows PE", "[exit 0]"])

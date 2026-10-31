@@ -209,6 +209,38 @@ run("run linux_sig.elf", ["alarm: pause=-1 errno=EINTR alrm=1", "itimer: ticks>=
 run("run linux_sig.elf", ["sigsuspend: ret=-1 errno=EINTR usr2=1", "sigpipe-ignored: write=-1 errno=EPIPE", "sigpipe-default: signaled=1 sig=13"], "signals: sigsuspend, SIGPIPE ignored (EPIPE) and fatal by default", timeout=150)
 run("run linux_sig.elf", ["abort: signaled=1 sig=6", "term-busy-loop: sig=15", "sigtimedwait: got=1", "posix-timer: fired=1", "done"], "signals: SIGABRT, SIGTERM kills a busy loop, sigtimedwait, POSIX timers", timeout=150)
 
+# ---- asynchronous signal delivery (handlers run while the program spins in user mode; registers survive)
+run("run linux_async.elf", ["async-timer: handled=1 registers-intact=1", "async-kill: handled=1 registers-intact=1", "async-blocked: delivered_while_blocked=0 after_unblock=1", "async-repeat: handler_runs>=5 1", "done"], "signals: handled signals interrupt a user-mode spin loop (timer + kill from a child), rax/rcx/r11/xmm survive, blocked stays pending", timeout=150)
+
+# ---- Windows exception dispatch (vectored handlers, CONTEXT editing, RaiseException, unhandled-exception filter)
+run("run win_seh.exe", ["ud2: hits=1 regs=1 sse=1", "av: hits=1 write-info=1 retried-store=1", "div0: hits=1 quotient=10", "raise: hits=1 code=e0000001 n=2 info=aaaa,bbbb after-return-ok=1", "order: FL", "filter-continue: hits=1", "done"], "Windows: vectored exception handlers resume faults (#UD/#PF/#DE) via CONTEXT edits, RaiseException params, handler order, unhandled filter", timeout=120)
+run("run win_seh.exe die", ["filter: dying", "[exit 3221225477]"], "Windows: filter returning EXECUTE_HANDLER ends the process with the exception code (0xC0000005)", timeout=120)
+
+# ---- futex waits are interruptible; signal masks are per thread
+run("run linux_futex.elf", ["untimed: ret=-1 errno=EINTR handled=1", "restart: ret=-1 errno=EAGAIN handled=1", "timed: ret=-1 errno=EINTR quick=1 handled=1", "timeout: ret=-1 errno=ETIMEDOUT", "wake: woke=1 thread_ok=1", "thread-signal: handler_ran=1 thread_ok=1", "done"], "futex: FUTEX_WAIT interrupted by signals (EINTR / SA_RESTART restart / timed), wake still works, a finished thread no longer blocks the process's signals", timeout=150)
+
+# ---- thread-directed signals (tgkill / pthread_kill), per-thread masks
+run("run linux_tsig.elf", ["futex-thread: handled=1 on_worker=1", "spin-thread: handled=1 on_worker=1", "self: handled=1 on_main=1", "blocked: early=0 late=1 on_worker=1", "process-signal: handled=100 on_worker=1", "checks: bad_tid=ESRCH sig0=0 bad_tgid=ESRCH", "done"], "signals: pthread_kill/tgkill reach exactly the named thread (futex wait, user-mode spin, blocked->unblocked), process signals go to a thread that accepts them", timeout=150)
+
+# ---- blocking console reads are interruptible; a partly typed line survives SA_RESTART interruptions
+send("run linux_tty.elf\r")
+seg = expect("sig\r", 30)
+ok0 = seg is not None
+import time as _t
+if ok0:
+    send("A"); _t.sleep(0.25); send("d"); _t.sleep(0.25); send("a"); _t.sleep(0.25); send("\r")
+seg = expect("deloxy-sh> ", 30) if ok0 else None
+check("tty: console read interrupted by a signal (EINTR; SA_RESTART restarts, typed-so-far line survives)", seg is not None and "tty1: ret=-1 errno=EINTR handled=1" in text() and "tty2: got='Ada' interrupted_several_times=1" in text(), "" if seg is not None else repr(text()[-300:]))
+
+# ---- process groups, sessions, job control; Ctrl-C reaches the foreground program
+run("run linux_jobs.elf", ["ids: pgrp_is_pid=1 sid_is_pid=1 setsid_leader=EPERM", "child-group: own=1 same_as_parent=0", "group-setup: setpgid=0,0 pgids_equal=1", "group-kill: kill=0 reaped=2 by_sigterm=2 echild_after=yes", "wait-pgid0: got_child=1 status=7", "kill0: ret=0", "stop-cont: running_before=1 stopped=1 silent_while_stopped=1 continued=1 running_after=1", "tstp-spinner: stopped=1 sig=20", "spinner-killed: 1", "done"], "job control: setpgid/getpgid/setsid, kill(-pgrp), waitpid(-pgrp/0), SIGSTOP/SIGTSTP stop (also a user-mode spinner), SIGCONT, WUNTRACED/WCONTINUED", timeout=150)
+send("run linux_jobs.elf spin\r")
+seg = expect("spinning", 30)
+if seg is not None:
+    time.sleep(0.5); send("\x03")
+seg2 = expect("deloxy-sh> ", 20) if seg is not None else None
+check("console: Ctrl-C interrupts the running Linux program (^C echoed, program ends, shell prompt returns)", seg2 is not None and "^C" in seg2, repr((seg2 or text()[-300:])[-300:]))
+
 # ---- filesystem: working directory, hierarchical read-only tree, symlinks, /tmp, *at() calls, error codes
 send("perms allow linux_fs.elf rw\r"); expect("deloxy-sh> ", 10)
 run("run linux_fs.elf", ["cwd0: /", "rootfs: read 34 'hello from the rootfs'", "symlink-file: 'hello'", "symlink-dir: 'deep file'", "readlink: 9 'hello.txt'", "usrmerge: 'libdata'"], "fs: read-only tree: files, directories, symlinks (file and directory), readlink, usr-merge aliases", timeout=150)

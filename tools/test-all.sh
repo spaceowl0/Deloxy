@@ -44,6 +44,10 @@ python3 tools/shell-test.py "$OUT/normal.iso" "$OUT/sh" | grep -v '^served' | ta
 if [ -n "$OVMF" ]; then python3 tools/shell-test.py "$OUT/normal.iso" "$OUT/sh-uefi" --uefi "$OVMF" | grep -v '^served' | tail -3; phase "shell end-to-end, UEFI" ${PIPESTATUS[0]}; fi
 python3 tools/store-test.py "$OUT/normal.iso" "$OUT/store" | grep -v '^served' | tail -3; phase "persistent store end-to-end (3 boots), BIOS" ${PIPESTATUS[0]}
 if [ -n "$OVMF" ]; then python3 tools/store-test.py "$OUT/normal.iso" "$OUT/store-uefi" --uefi "$OVMF" | grep -v '^served' | tail -3; phase "persistent store end-to-end (3 boots), UEFI" ${PIPESTATUS[0]}; fi
+python3 tools/pfs-test.py "$OUT/normal.iso" "$OUT/pfs" | grep -v '^PASS' | tail -3; phase "persistent folders + DLLs + CPU-fault signals (2 boots)" ${PIPESTATUS[0]}
+rm -f "$OUT/files.img"; truncate -s 64M "$OUT/files.img"
+DISK="$OUT/files.img" python3 tools/runone.py "$OUT/normal.iso" "~format" "yes" "mkdir /home" "mkdir /home/docs" "save /home/note.txt hello-from-home" "save /home/docs/deep.txt deepfile" "save top.txt toplevel" >/dev/null
+python3 tools/files-test.py "$OUT/normal.iso" "$OUT/files.img" "$OUT/files" | grep -v '^PASS' | tail -3; phase "Files app folder browsing (GUI, store disk)" ${PIPESTATUS[0]}
 python3 tools/compat-test.py "$OUT/normal.iso" "$OUT/compat" | tail -3; phase "compat: glibc ELF + mingw PE, BIOS" ${PIPESTATUS[0]}
 if [ -n "$OVMF" ]; then python3 tools/compat-test.py "$OUT/normal.iso" "$OUT/compat-uefi" --uefi "$OVMF" | tail -3; phase "compat: glibc ELF + mingw PE, UEFI" ${PIPESTATUS[0]}; fi
 
