@@ -324,3 +324,29 @@ Exit criteria:
 - [x] P9   Full network access mode + custom time/data limits + internet-only (prompt, shell, Permissions manager)
 
 **M1-M8 are done (verified in QEMU). Next: post-alpha work, see docs/HANDOFF.md section 9 and docs/KNOWN_ISSUES.md.** Original note: start with M1.5, then M2. M2 is the critical path: the APIC (`map_mmio`), scheduler stacks, user address spaces, and every later phase depend on the VMM and heap.
+- [x] P10  Full networking (DNS via kernel resolver + virtual nameserver, UDP, listen/accept with inbound firewall grants, select/epoll, non-blocking connect), e1000 NIC, xHCI + USB HID (keyboard/mouse/tablet), AHCI/SATA, wltd v7 (real heap, GetProcAddress, MSVC runtime APIs, wide APIs, eventfd, blocking pipes), process-teardown leak fixed
+
+- [x] P11  CSPRNG (RDSEED/virtio-rng/jitter + ChaCha20), TLS demonstrated (static OpenSSL, verified chains), Windows floating point (math, printf/scanf %f, strtod), Linux dynamic linking (ld.so + glibc/libstdc++ in the image), dup2 stdio redirection, /dev/null+/proc basics, measured compatibility corpus
+
+### Next (suggested order, updated)
+- [x] P12  fork / vfork / posix_spawn / execve / wait4 / kill (eager-copy fork, in-place exec with permission re-resolution)
+- [x] P13  signals + timers (handlers/masks/sigreturn, SIGCHLD, SIGPIPE, alarm/setitimer/POSIX timers, interruptible syscalls)
+- [x] P14  hierarchical read-only root tree (2nd boot module) + volatile /tmp + cwd/*at()/symlinks/#! ; CPython 3.12 and `file` run
+- [x] P15  writable hierarchical persistent filesystem (DeloxyStore v2: dirs, symlinks, modes, atomic rename, multi-extent files, crash-safe COW commits, v1 migration; `/store`, `/home`, `/var`... for Linux, Win32 and the shell)
+- [x] P16  Windows DLL loading (static imports of DLL files, ordinals, forwarders, dependency chains, relocation, `DllMain` via user-mode stubs, LoadLibrary/GetProcAddress/FreeLibrary with reload)
+- [x] P17  CPU faults as signals (SIGSEGV/SIGFPE/SIGILL with siginfo, `sigaltstack`, restart after handler, default/ignored/blocked = kill)
+- [x] P24  Process groups/sessions, group kill/wait, SIGSTOP/SIGTSTP/SIGCONT + WUNTRACED/WCONTINUED, Ctrl-C to the foreground program (`user/poc/linux_jobs.c`)
+- [x] P23  Interruptible console reads (partial line survives) and `connect` (`user/poc/linux_tty.c`)
+- [x] P22  Thread-directed signals: tkill/tgkill/pthread_kill, per-thread pending sets, thread registry (`user/poc/linux_tsig.c`)
+- [x] P21  Interruptible FUTEX_WAIT, per-thread signal masks (`user/poc/linux_futex.c`)
+- [x] P20  Windows exception dispatch: vectored handlers, `SetUnhandledExceptionFilter`, `RaiseException`, real EXCEPTION_RECORD/CONTEXT with resume (`abi/win_exc.rs`, `user/poc/win_seh.c`)
+- [x] P19  Asynchronous signal delivery on timer interrupts (full-register frames, `iret_trapframe`), `getppid` fixed; `user/poc/linux_async.c`
+- [x] P18  Files app browses the hierarchical store (folders, `..`, Backspace, New folder, Delete for empty folders; `tools/files-test.py` 25 checks)
+0. SIGBUS/SIGTRAP/FP exceptions, process groups/job control (so data trees like Python's stdlib work), `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
+0b. **Table-based Windows SEH** (`.pdata` unwind, `__try/__except`, `RtlUnwind`; vectored handlers/filter are done in P20), DLL thread notifications + TLS, delay-load imports, process-exit `DLL_PROCESS_DETACH`.
+(old item, now done) **Crypto-quality entropy** (`getrandom`, RDSEED/RDRAND + virtio-rng + jitter pool) so ported TLS stacks are safe; then ship a TLS-capable sample (mbedTLS/BearSSL static) as a test program.
+2. **Floating point in the shim ABI** (xmm0/xmm1 args and returns for Windows, math functions, `%f`/`atof`), needed by most real applications.
+3. USB: external hubs, mass storage (bulk transfers, then a read-only FAT driver), then audio class. NVMe driver. e1000e / virtio-gpu / UEFI GOP resize.
+4. Linux: fork/execve, AF_UNIX sockets (socketpair), signals, timerfd/signalfd/inotify, `/proc` basics, dynamic linking (ld.so) for non-static binaries.
+5. Windows: user32/gdi32 windowing mapped onto deloxy-de, structured exception handling, COM basics.
+6. Real-hardware bring-up pass for the new drivers (see HANDOFF 9l).
