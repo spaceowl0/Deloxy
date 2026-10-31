@@ -26,6 +26,7 @@ pub const SYS_STORE_OPEN: i64 = 34;
 pub const SYS_STORE_WRITE: i64 = 35;
 pub const SYS_STORE_CTL: i64 = 36;
 pub const SYS_PERM: i64 = 37;
+pub const SYS_STORE_FS: i64 = 38;
 pub const SYS_MMAP_ANON: i64 = 4;
 
 pub const INFO_BASE: usize = 0x30_0000;
