@@ -25,8 +25,8 @@ generate a key on an offline machine, store the seed offline (ideally split acro
 sign each release manifest offline, and document a revocation/rotation path (the alpha has none: a lost key means shipping a new kernel). `tools/lib/ed25519_ref.py` is a non-constant-time test signer and must never touch a real key.
 
 ## Persistent store
-Access is by capability only (`Store`: READ list/open, WRITE write/delete, GRANT format); the shell is the only holder. A blank or unrecognised disk is never formatted automatically, and formatting needs an explicit human `yes`.
-Integrity: CRC-32 on every file and on both directory copies (detects accidental corruption and torn writes, **not** a malicious writer: CRC-32 is not a MAC, and the disk is not encrypted or authenticated).
+Access is by capability only (`Store`: READ list/open/stat/readdir/read, WRITE write/delete/mkdir/rename/symlink/chmod, GRANT format); the shell is the only holder. The store is a hierarchical copy-on-write filesystem since step 15: every metadata image and every file carries a CRC-32, a root record commits each operation, and paths are resolved inside the tree (symlink targets can never leave it; `..` stops at the store root). A blank or unrecognised disk is never formatted automatically, and formatting needs an explicit human `yes`.
+Integrity: CRC-32 on every file, on every metadata image and on both root records (detects accidental corruption and torn writes, **not** a malicious writer: CRC-32 is not a MAC, and the disk is not encrypted or authenticated).
 Crash safety is tested against a fault-injecting RAM disk and QEMU only. `upd.*` names are reserved to the kernel updater: the rollback floor (`upd.floor`) cannot be forged or lowered by user programs through the syscall interface,
 but anyone who can write the raw disk can (no secure storage/TPM); a signed manifest is still required to raise it. Stored programs are executable via `Spawn` and are not signature-checked.
 Threats not covered: physical access to the disk, DMA, a compromised hypervisor, power-loss behaviour of real devices with volatile write caches that ignore FLUSH.
@@ -37,7 +37,7 @@ Foreign programs are untrusted by default: no file access until the user decides
 Limits: foreign processes are capped at 128 MiB, 32 threads and 64 open files. A user can end any non-shell process from the Task Manager.
 
 ## Foreign programs (deloxy-wltd)
-File access is a capability: Linux/Windows programs see files only if they were spawned with `Dir`/`Store` capabilities (the shell grants both to what it runs; native children never get them). Writes are limited to the store, flat names, 4 MiB per file, never `upd.*`.
+File access is a capability: Linux/Windows programs see files only if they were spawned with `Dir`/`Store` capabilities (the shell grants both to what it runs; native children never get them). Writes are limited to the store (hierarchical paths allowed, 16 MiB per file), never `upd.*` or `perms.*` at the store root; the check is repeated on the symlink-resolved path (`Store::realpath`) so a link cannot be used to reach a kernel-owned file, and `de.conf` cannot be deleted or replaced by rename. Programs cannot create hard links. Stored programs and DLLs are loaded without signature checks (the permission model, not code signing, is what confines them).
 The Linux/NT syscall layers are a large attack surface written for compatibility, not hardened beyond the existing user-pointer checks (`copy_from/to_user`) and fuzzing of the loaders; they run foreign code in ring 3 under the same page-table isolation as native code.
 
 ## Known weak spots

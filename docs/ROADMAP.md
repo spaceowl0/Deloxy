@@ -332,11 +332,21 @@ Exit criteria:
 - [x] P12  fork / vfork / posix_spawn / execve / wait4 / kill (eager-copy fork, in-place exec with permission re-resolution)
 - [x] P13  signals + timers (handlers/masks/sigreturn, SIGCHLD, SIGPIPE, alarm/setitimer/POSIX timers, interruptible syscalls)
 - [x] P14  hierarchical read-only root tree (2nd boot module) + volatile /tmp + cwd/*at()/symlinks/#! ; CPython 3.12 and `file` run
-0. **Writable hierarchical persistent filesystem** (directories in the store), **asynchronous signal delivery + CPU-fault signals** (SIGSEGV handlers for runtimes), process groups/job control (so data trees like Python's stdlib work), then `/proc/<pid>`.
-0b. **PE DLL loading** (LoadLibrary/implicit imports of user DLLs, DllMain via a user-mode init trampoline), Windows SEH.
+- [x] P15  writable hierarchical persistent filesystem (DeloxyStore v2: dirs, symlinks, modes, atomic rename, multi-extent files, crash-safe COW commits, v1 migration; `/store`, `/home`, `/var`... for Linux, Win32 and the shell)
+- [x] P16  Windows DLL loading (static imports of DLL files, ordinals, forwarders, dependency chains, relocation, `DllMain` via user-mode stubs, LoadLibrary/GetProcAddress/FreeLibrary with reload)
+- [x] P17  CPU faults as signals (SIGSEGV/SIGFPE/SIGILL with siginfo, `sigaltstack`, restart after handler, default/ignored/blocked = kill)
+- [x] P24  Process groups/sessions, group kill/wait, SIGSTOP/SIGTSTP/SIGCONT + WUNTRACED/WCONTINUED, Ctrl-C to the foreground program (`user/poc/linux_jobs.c`)
+- [x] P23  Interruptible console reads (partial line survives) and `connect` (`user/poc/linux_tty.c`)
+- [x] P22  Thread-directed signals: tkill/tgkill/pthread_kill, per-thread pending sets, thread registry (`user/poc/linux_tsig.c`)
+- [x] P21  Interruptible FUTEX_WAIT, per-thread signal masks (`user/poc/linux_futex.c`)
+- [x] P20  Windows exception dispatch: vectored handlers, `SetUnhandledExceptionFilter`, `RaiseException`, real EXCEPTION_RECORD/CONTEXT with resume (`abi/win_exc.rs`, `user/poc/win_seh.c`)
+- [x] P19  Asynchronous signal delivery on timer interrupts (full-register frames, `iret_trapframe`), `getppid` fixed; `user/poc/linux_async.c`
+- [x] P18  Files app browses the hierarchical store (folders, `..`, Backspace, New folder, Delete for empty folders; `tools/files-test.py` 25 checks)
+0. SIGBUS/SIGTRAP/FP exceptions, process groups/job control (so data trees like Python's stdlib work), `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
+0b. **Table-based Windows SEH** (`.pdata` unwind, `__try/__except`, `RtlUnwind`; vectored handlers/filter are done in P20), DLL thread notifications + TLS, delay-load imports, process-exit `DLL_PROCESS_DETACH`.
 (old item, now done) **Crypto-quality entropy** (`getrandom`, RDSEED/RDRAND + virtio-rng + jitter pool) so ported TLS stacks are safe; then ship a TLS-capable sample (mbedTLS/BearSSL static) as a test program.
 2. **Floating point in the shim ABI** (xmm0/xmm1 args and returns for Windows, math functions, `%f`/`atof`), needed by most real applications.
 3. USB: external hubs, mass storage (bulk transfers, then a read-only FAT driver), then audio class. NVMe driver. e1000e / virtio-gpu / UEFI GOP resize.
 4. Linux: fork/execve, AF_UNIX sockets (socketpair), signals, timerfd/signalfd/inotify, `/proc` basics, dynamic linking (ld.so) for non-static binaries.
-5. Windows: user32/gdi32 windowing mapped onto deloxy-de, structured exception handling, DLL loading (LoadLibrary of PE DLLs), COM basics.
+5. Windows: user32/gdi32 windowing mapped onto deloxy-de, structured exception handling, COM basics.
 6. Real-hardware bring-up pass for the new drivers (see HANDOFF 9l).
