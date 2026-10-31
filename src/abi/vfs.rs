@@ -254,6 +254,7 @@ pub fn resolve_abs(p: &Arc<Process>, path: &str) -> String {
 }
 
 const EROFS: i64 = 30;
+const EBUSY_: i64 = 16;
 const ENOTDIR: i64 = 20;
 const ENOTEMPTY: i64 = 39;
 const EEXIST: i64 = 17;
@@ -345,8 +346,172 @@ fn open_hier(p: &Arc<Process>, abs: &str, write: bool, create: bool, trunc: bool
 
 /// open(2) on the unified namespace: special files, the flat initramfs/store names (`/x`, `/store/x`), `/tmp/...` and the
 /// hierarchical read-only tree, resolved against the working directory.
+
+// ------------------------------------------------------------------ persistent hierarchical store ---
+
+/// Top-level names that live in the persistent store (unless the read-only root tree already has them).
+const PFS_ALIASES: [&str; 7] = ["home", "var", "opt", "srv", "root", "mnt", "data"];
+
+/// Path inside the persistent store for a canonical absolute path (no leading '/'), if it lies in the persistent
+/// tree: `/store/...` and the `/home`, `/var`, `/opt`, `/srv`, `/root`, `/mnt`, `/data` subtrees.
+pub fn pfs_map(abs: &str) -> Option<String> {
+    if abs == "store" {
+        return Some(String::new());
+    }
+    if let Some(r) = abs.strip_prefix("store/") {
+        return Some(String::from(r));
+    }
+    for a in PFS_ALIASES {
+        if (abs == a || abs.strip_prefix(a).map_or(false, |r| r.starts_with('/'))) && crate::fs::rootfs::lookup(a).is_none() {
+            return Some(String::from(abs));
+        }
+    }
+    None
+}
+
+/// The store path of an open file created by `open_pfs`.
+pub fn pfs_rel(name: &str) -> Option<&str> {
+    name.strip_prefix("store/")
+}
+
+fn first_comp(rel: &str) -> &str {
+    rel.split('/').find(|c| !c.is_empty() && *c != ".").unwrap_or("")
+}
+
+/// Kernel-owned root names: `upd.*`/`perms.*` may never be changed by programs; `de.conf` may be rewritten but not
+/// removed or replaced by rename.
+fn pfs_guarded(rel: &str, destructive: bool) -> bool {
+    let c = first_comp(rel);
+    crate::store::is_reserved(c) || (destructive && c == "de.conf")
+}
+
+fn store_ready() -> bool {
+    crate::store::state() == crate::store::State::Ready
+}
+
+/// Run a store operation: `ENOENT` when no store is mounted, the POSIX errno of any store error.
+fn pfs_do<R>(f: impl FnOnce(&mut crate::store::Store<crate::drivers::blk::Disk>) -> Result<R, crate::store::StoreErr>) -> Result<R, i64> {
+    if !store_ready() {
+        return Err(ENOENT);
+    }
+    match crate::store::with(f) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.errno()),
+        Err(_) => Err(ENOENT),
+    }
+}
+
+fn open_pfs(p: &Arc<Process>, abs: &str, rel: &str, write: bool, create: bool, trunc: bool, append: bool) -> Result<OpenFile, i64> {
+    let (_, store_r, store_w) = can(p);
+    if write && !store_w || !write && !store_r {
+        return Err(EACCES);
+    }
+    if !store_ready() {
+        if rel.is_empty() && !write {
+            return Ok(dir_file(abs, Vec::new()));
+        }
+        return Err(ENOENT);
+    }
+    match pfs_do(|s| s.stat(rel, true)) {
+        Ok(st) if st.kind == crate::store::Kind::Dir => {
+            if write {
+                return Err(EISDIR);
+            }
+            let ents = pfs_do(|s| s.readdir(rel))?;
+            Ok(dir_file(abs, ents.into_iter().map(|e| (e.name, e.kind == crate::store::Kind::Dir)).collect()))
+        }
+        Ok(_) => {
+            let real = pfs_do(|s| s.realpath(rel, true))?;
+            if write && pfs_guarded(&real, false) {
+                return Err(EACCES);
+            }
+            if write {
+                let buf: Vec<u8> = if trunc { Vec::new() } else { pfs_do(|s| s.read(rel))? };
+                let pos = if append { buf.len() } else { 0 };
+                return Ok(OpenFile { name: alloc::format!("store/{}", real), data: Data::Buf(buf), pos, writable: true, dirty: trunc, eof: false });
+            }
+            let v = pfs_do(|s| s.read(rel))?;
+            Ok(OpenFile { name: alloc::format!("store/{}", real), data: Data::Shared(Arc::new(v)), pos: 0, writable: false, dirty: false, eof: false })
+        }
+        Err(e) if e == ENOENT && write && (create || trunc) => {
+            let real = pfs_do(|s| s.realpath_new(rel))?;
+            if pfs_guarded(&real, false) {
+                return Err(EACCES);
+            }
+            Ok(OpenFile { name: alloc::format!("store/{}", real), data: Data::Buf(Vec::new()), pos: 0, writable: true, dirty: true, eof: false })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `stat`/`lstat` on a persistent path: `None` if the path is not in the persistent tree.
+pub fn pfs_stat(p: &Arc<Process>, abs: &str, follow: bool) -> Option<Result<crate::store::Stat, i64>> {
+    let rel = pfs_map(abs)?;
+    let (_, store_r, store_w) = can(p);
+    if !(store_r || store_w) {
+        return Some(Err(EACCES));
+    }
+    if !store_ready() && rel.is_empty() {
+        return Some(Ok(crate::store::Stat { ino: 1, kind: crate::store::Kind::Dir, mode: 0o755, size: 0, mtime: 0, crc: 0 }));
+    }
+    Some(pfs_do(|s| s.stat(&rel, follow)))
+}
+
+/// Stat of an already open persistent file (by `OpenFile::name`).
+pub fn pfs_stat_open(name: &str) -> Option<crate::store::Stat> {
+    let rel = pfs_rel(name)?;
+    crate::store::with(|s| s.stat(rel, true)).ok().and_then(|r| r.ok())
+}
+
+pub fn symlink(p: &Arc<Process>, target: &str, linkpath: &str) -> Result<(), i64> {
+    let abs = resolve_abs(p, linkpath);
+    let rel = pfs_map(&abs).ok_or(EROFS)?;
+    let (_, _, store_w) = can(p);
+    if !store_w {
+        return Err(EACCES);
+    }
+    let real = pfs_do(|s| s.realpath_new(&rel))?;
+    if pfs_guarded(&real, true) {
+        return Err(EACCES);
+    }
+    pfs_do(|s| s.symlink(target, &rel))
+}
+
+pub fn readlink_pfs(p: &Arc<Process>, abs: &str) -> Option<Result<String, i64>> {
+    let rel = pfs_map(abs)?;
+    let (_, store_r, _) = can(p);
+    if !store_r {
+        return Some(Err(EACCES));
+    }
+    Some(pfs_do(|s| s.readlink(&rel)).map_err(|e| if e == 22 { 22 } else { e }))
+}
+
+pub fn chmod(p: &Arc<Process>, path: &str, mode: u32) -> Result<(), i64> {
+    let abs = resolve_abs(p, path);
+    let Some(rel) = pfs_map(&abs) else { return Ok(()) };
+    let (_, _, store_w) = can(p);
+    if !store_w {
+        return Err(EACCES);
+    }
+    let real = pfs_do(|s| s.realpath(&rel, true))?;
+    if pfs_guarded(&real, false) {
+        return Err(EACCES);
+    }
+    pfs_do(|s| s.chmod(&rel, (mode & 0o7777) as u16))
+}
+
+pub fn chmod_open(name: &str, mode: u32) -> Result<(), i64> {
+    match pfs_rel(name) {
+        Some(rel) => pfs_do(|s| s.chmod(rel, (mode & 0o7777) as u16)),
+        None => Ok(()),
+    }
+}
+
 pub fn open(p: &Arc<Process>, path: &str, write: bool, create: bool, trunc: bool, append: bool) -> Result<OpenFile, i64> {
     let abs = resolve_abs(p, path);
+    if let Some(rel) = pfs_map(&abs) {
+        return open_pfs(p, &abs, &rel, write, create, trunc, append);
+    }
     match open_old(p, &abs, write, create, trunc, append) {
         Err(ENOENT) => open_hier(p, &abs, write, create, trunc, append),
         r => r,
@@ -357,6 +522,9 @@ pub fn open(p: &Arc<Process>, path: &str, write: bool, create: bool, trunc: bool
 pub fn is_dir_abs(p: &Arc<Process>, abs: &str) -> bool {
     if is_dir_path(abs) {
         return true;
+    }
+    if let Some(r) = pfs_stat(p, abs, true) {
+        return matches!(r, Ok(st) if st.kind == crate::store::Kind::Dir);
     }
     if is_tmp(abs) {
         return abs == "tmp" || crate::fs::tmpfs::is_dir(abs);
@@ -369,6 +537,19 @@ pub fn is_dir_abs(p: &Arc<Process>, abs: &str) -> bool {
 pub fn mkdir(p: &Arc<Process>, path: &str) -> Result<(), i64> {
     let abs = resolve_abs(p, path);
     let (_, _, store_w) = can(p);
+    if let Some(rel) = pfs_map(&abs) {
+        if rel.is_empty() {
+            return Err(EEXIST);
+        }
+        if !store_w {
+            return Err(EACCES);
+        }
+        let real = pfs_do(|s| s.realpath_new(&rel))?;
+        if pfs_guarded(&real, true) {
+            return Err(EACCES);
+        }
+        return pfs_do(|s| s.mkdir(&rel));
+    }
     if !is_tmp(&abs) {
         return Err(if crate::fs::rootfs::lookup(&abs).is_some() || abs.is_empty() { EEXIST } else { EROFS });
     }
@@ -381,6 +562,18 @@ pub fn mkdir(p: &Arc<Process>, path: &str) -> Result<(), i64> {
 pub fn rmdir(p: &Arc<Process>, path: &str) -> Result<(), i64> {
     let abs = resolve_abs(p, path);
     let (_, _, store_w) = can(p);
+    if let Some(rel) = pfs_map(&abs) {
+        if rel.is_empty() {
+            return Err(EBUSY_);
+        }
+        if !store_w {
+            return Err(EACCES);
+        }
+        if pfs_guarded(&rel, true) {
+            return Err(EACCES);
+        }
+        return pfs_do(|s| s.rmdir(&rel));
+    }
     if !is_tmp(&abs) || abs == "tmp" {
         return Err(EROFS);
     }
@@ -393,8 +586,20 @@ pub fn rmdir(p: &Arc<Process>, path: &str) -> Result<(), i64> {
 pub fn rename(p: &Arc<Process>, from: &str, to: &str) -> Result<(), i64> {
     let (a, b) = (resolve_abs(p, from), resolve_abs(p, to));
     let (_, _, store_w) = can(p);
+    if let (Some(ra), Some(rb)) = (pfs_map(&a), pfs_map(&b)) {
+        if ra.is_empty() || rb.is_empty() {
+            return Err(EBUSY_);
+        }
+        if !store_w {
+            return Err(EACCES);
+        }
+        if pfs_guarded(&ra, true) || pfs_guarded(&rb, true) {
+            return Err(EACCES);
+        }
+        return pfs_do(|s| s.rename(&ra, &rb));
+    }
     if !is_tmp(&a) || !is_tmp(&b) {
-        return Err(18); // EXDEV: renames only work inside /tmp
+        return Err(18); // EXDEV: renames only work inside /tmp or inside the persistent store
     }
     if !store_w {
         return Err(EACCES);
@@ -522,7 +727,7 @@ fn open_old(p: &Arc<Process>, path: &str, write: bool, create: bool, trunc: bool
 }
 
 pub fn is_dir_path(path: &str) -> bool {
-    matches!(path, "" | "/" | "." | "./" | "/store" | "store" | "store/" | "/store/")
+    matches!(path, "" | "/" | "." | "./")
 }
 
 /// Directory snapshot: ".", "..", initramfs files (with a Dir capability) and store files (with Store READ).
@@ -556,6 +761,19 @@ pub fn open_dir(p: &Arc<Process>) -> OpenFile {
     }
     names.push(String::from("tmp/"));
     names.push(String::from("proc/"));
+    names.push(String::from("store/"));
+    if store_r {
+        let _ = crate::store::with(|s| {
+            if let Ok(ents) = s.readdir("") {
+                for e in ents {
+                    let d = alloc::format!("{}/", e.name);
+                    if e.kind == crate::store::Kind::Dir && PFS_ALIASES.contains(&e.name.as_str()) && crate::fs::rootfs::lookup(&e.name).is_none() && !names.contains(&d) {
+                        names.push(d);
+                    }
+                }
+            }
+        });
+    }
     OpenFile { name: String::from("/"), data: Data::Dir(names), pos: 0, writable: false, dirty: false, eof: false }
 }
 
@@ -567,6 +785,15 @@ pub fn unlink(p: &Arc<Process>, path: &str) -> Result<(), i64> {
             return Err(EACCES);
         }
         return crate::fs::tmpfs::remove(&abs).map_err(tmp_err);
+    }
+    if let Some(rel) = pfs_map(&abs) {
+        if !store_w {
+            return Err(EACCES);
+        }
+        if pfs_guarded(&rel, true) {
+            return Err(EACCES);
+        }
+        return pfs_do(|s| s.unlink(&rel));
     }
     let (name, _) = normalize(&abs)?;
     if !store_w || crate::store::is_reserved(&name) || name == "de.conf" {
@@ -592,13 +819,14 @@ pub fn flush(f: &mut OpenFile) -> Result<(), i64> {
             Err(e) => Err(tmp_err(e)),
         };
     }
-    let r = crate::store::with(|s| s.write(&f.name, f.bytes()));
+    let path = pfs_rel(&f.name).unwrap_or(&f.name);
+    let r = crate::store::with(|s| s.write(path, f.bytes()));
     match r {
         Ok(Ok(())) => {
             f.dirty = false;
             Ok(())
         }
-        Ok(Err(crate::store::StoreErr::NoSpace)) | Ok(Err(crate::store::StoreErr::TooManyFiles)) => Err(ENOSPC),
+        Ok(Err(e)) => Err(e.errno()),
         _ => Err(EIO),
     }
 }

@@ -22,6 +22,20 @@ static TTY: IrqMutex<Inner> = IrqMutex::new(Inner { input: VecDeque::new(), out:
 
 /// Queue input bytes (dropped when the queue is full).
 pub fn push_input(bytes: &[u8]) {
+    // Ctrl-C interrupts the programs the shell started (instead of being typed into them)
+    let mut filtered: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let bytes = if bytes.contains(&0x03) {
+        for &b in bytes {
+            if b == 0x03 && crate::abi::signals::interrupt_foreground() {
+                write(b"^C\r\n");
+            } else {
+                filtered.push(b);
+            }
+        }
+        &filtered[..]
+    } else {
+        bytes
+    };
     let mut t = TTY.lock();
     for &b in bytes {
         if t.input.len() < IN_CAP {

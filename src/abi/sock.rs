@@ -282,6 +282,7 @@ pub fn connect(p: &Arc<Process>, slot: usize, ip: [u8; 4], port: u16) -> Result<
     let id = loop {
         match net::tcp_connect(&grant, ip, port) {
             Ok(id) => break id,
+            Err(NetErr::NotReady) if super::signals::interrupted(p) => return Err(super::signals::EINTR),
             Err(NetErr::NotReady) if crate::time::uptime_ms() - t0 < CONNECT_TIMEOUT_MS => task::sleep_ms(5),
             Err(NetErr::NotReady) => return Err(ETIMEDOUT),
             Err(NetErr::Denied) => return Err(EACCES),
@@ -313,6 +314,12 @@ pub fn connect(p: &Arc<Process>, slot: usize, ip: [u8; 4], port: u16) -> Result<
                 if crate::time::uptime_ms() - t0 > CONNECT_TIMEOUT_MS {
                     reset_stream(p, slot);
                     return Err(ETIMEDOUT);
+                }
+                if super::signals::interrupted(p) {
+                    // like Linux: the handshake carries on in the background; the next connect() reports EALREADY/EISCONN
+                    let deadline = t0 + CONNECT_TIMEOUT_MS;
+                    let _ = with_state(p, slot, |s| s.connecting = Some(deadline));
+                    return Err(super::signals::EINTR);
                 }
                 task::sleep_ms(2);
             }

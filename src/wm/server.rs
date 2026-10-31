@@ -257,8 +257,13 @@ struct Window {
 #[derive(Clone)]
 struct FEntry {
     name: String,
+    /// full path inside the store (leading '/'); equals `name` for system files
+    path: String,
     size: u64,
     store: bool,
+    dir: bool,
+    /// the synthetic ".." row
+    up: bool,
 }
 
 struct FilesState {
@@ -268,6 +273,8 @@ struct FilesState {
     last_click: (usize, u64),
     status: String,
     gen: u64,
+    /// current store directory ("" = top level, which also lists the read-only system files)
+    cwd: String,
 }
 
 #[derive(Clone)]
@@ -324,6 +331,9 @@ fn files_del_btn() -> Rect {
 }
 fn files_refresh_btn() -> Rect {
     Rect::new(152, 6, 76, 24)
+}
+fn files_mkdir_btn() -> Rect {
+    Rect::new(236, 6, 96, 24)
 }
 fn files_up_btn() -> Rect {
     Rect::new(452, 58, 20, 20)
@@ -433,7 +443,7 @@ impl Server {
             wall_file: [0; 32],
             wall_note: "",
             cal_open: false,
-            files: FilesState { entries: Vec::new(), sel: None, scroll: 0, last_click: (usize::MAX, 0), status: String::new(), gen: 0 },
+            files: FilesState { entries: Vec::new(), sel: None, scroll: 0, last_click: (usize::MAX, 0), status: String::new(), gen: 0, cwd: String::new() },
             viewer: ViewerState { title: String::new(), lines: Vec::new(), scroll: 0 },
             tasks: TasksState { rows: Vec::new(), sel: None, status: String::new() },
             perms: PermsState { rows: Vec::new(), sel: None, status: String::new() },
@@ -1249,16 +1259,52 @@ impl Server {
 
     fn refresh_files(&mut self) {
         let mut v: Vec<FEntry> = Vec::new();
-        if let Some(root) = crate::fs::root() {
-            for f in root.files.iter() {
-                v.push(FEntry { name: f.name.clone(), size: f.data.len() as u64, store: false });
+        let top = self.files.cwd.is_empty();
+        let dir = if top { String::from("/") } else { self.files.cwd.clone() };
+        // a directory that vanished (deleted elsewhere): fall back to the top level
+        let listing = crate::store::with(|s| s.readdir(&dir));
+        let listing = match listing {
+            Ok(Ok(l)) => l,
+            Ok(Err(_)) if !top => {
+                self.files.cwd.clear();
+                self.files.status = String::from("folder no longer exists");
+                self.files.sel = None;
+                return self.refresh_files();
+            }
+            _ => Vec::new(),
+        };
+        if !top {
+            let parent = match self.files.cwd.rfind('/') {
+                Some(0) | None => String::new(),
+                Some(i) => String::from(&self.files.cwd[..i]),
+            };
+            v.push(FEntry { name: String::from(".."), path: parent, size: 0, store: true, dir: true, up: true });
+        }
+        let join = |name: &str| if top { alloc::format!("/{}", name) } else { alloc::format!("{}/{}", self.files.cwd, name) };
+        // folders first
+        for e in listing.iter().filter(|e| e.kind == crate::store::Kind::Dir) {
+            v.push(FEntry { name: e.name.clone(), path: join(&e.name), size: 0, store: true, dir: true, up: false });
+        }
+        if top {
+            if let Some(root) = crate::fs::root() {
+                for f in root.files.iter() {
+                    v.push(FEntry { name: f.name.clone(), path: f.name.clone(), size: f.data.len() as u64, store: false, dir: false, up: false });
+                }
             }
         }
-        let _ = crate::store::with(|s| {
-            for e in s.list() {
-                v.push(FEntry { name: e.name.clone(), size: e.size, store: true });
-            }
-        });
+        for e in listing.iter().filter(|e| e.kind != crate::store::Kind::Dir) {
+            let path = join(&e.name);
+            // a symlink to a folder behaves like a folder
+            let (dir, size) = if e.kind == crate::store::Kind::Symlink {
+                match crate::store::with(|s| s.stat(&path, true)) {
+                    Ok(Ok(st)) => (st.kind == crate::store::Kind::Dir, st.size),
+                    _ => (false, 0),
+                }
+            } else {
+                (false, e.size)
+            };
+            v.push(FEntry { name: e.name.clone(), path, size, store: true, dir, up: false });
+        }
         self.files.gen = crate::store::with(|s| s.stats().generation).unwrap_or(0);
         if let Some(i) = self.files.sel {
             if i >= v.len() {
@@ -1269,9 +1315,74 @@ impl Server {
         self.files.scroll = self.files.scroll.min(self.files.entries.len().saturating_sub(FILE_ROWS));
     }
 
+    fn enter_dir(&mut self, path: String) {
+        // canonicalise through the store so symlinks and ".." never leave an odd cwd string
+        let canon = match crate::store::with(|s| s.realpath(&path, true)) {
+            Ok(Ok(p)) => p,
+            _ => {
+                self.files.status = String::from("cannot open folder");
+                return;
+            }
+        };
+        let canon = canon.trim_end_matches('/');
+        self.files.cwd = if canon.is_empty() { String::new() } else if canon.starts_with('/') { String::from(canon) } else { alloc::format!("/{}", canon) };
+        self.files.sel = None;
+        self.files.scroll = 0;
+        self.refresh_files();
+        let shown = if self.files.cwd.is_empty() { "/" } else { self.files.cwd.as_str() };
+        self.files.status = alloc::format!("in {}", shown);
+        log::info!("[deloxy-de] files: cd '{}'", shown);
+    }
+
+    fn new_folder(&mut self) {
+        let base = if self.files.cwd.is_empty() { String::new() } else { self.files.cwd.clone() };
+        let mut name = String::from("folder");
+        let mut n = 1;
+        loop {
+            let p = alloc::format!("{}/{}", base, name);
+            match crate::store::with(|s| s.mkdir(&p)) {
+                Ok(Ok(())) => {
+                    log::info!("[deloxy-de] files: mkdir '{}'", p);
+                    self.files.status = alloc::format!("created {}", name);
+                    break;
+                }
+                Ok(Err(crate::store::StoreErr::Exists)) if n < 50 => {
+                    n += 1;
+                    name = alloc::format!("folder{}", n);
+                }
+                Ok(Err(e)) => {
+                    self.files.status = alloc::format!("cannot create folder: {:?}", e);
+                    break;
+                }
+                Err(_) => {
+                    self.files.status = String::from("no writable store (format a disk first)");
+                    break;
+                }
+            }
+        }
+        self.refresh_files();
+        if let Some(i) = self.files.entries.iter().position(|e| e.name == name && e.dir) {
+            self.files.sel = Some(i);
+            if i >= self.files.scroll + FILE_ROWS {
+                self.files.scroll = i + 1 - FILE_ROWS;
+            }
+        }
+    }
+
+    fn files_up(&mut self) {
+        if self.files.cwd.is_empty() {
+            return;
+        }
+        let parent = match self.files.cwd.rfind('/') {
+            Some(0) | None => String::new(),
+            Some(i) => String::from(&self.files.cwd[..i]),
+        };
+        self.enter_dir(if parent.is_empty() { String::from("/") } else { parent });
+    }
+
     fn entry_data(e: &FEntry) -> Option<Vec<u8>> {
         if e.store {
-            crate::store::with(|s| s.read(&e.name)).ok()?.ok()
+            crate::store::with(|s| s.read(&e.path)).ok()?.ok()
         } else {
             crate::fs::root()?.lookup(&e.name).map(|f| f.data.to_vec())
         }
@@ -1339,6 +1450,16 @@ impl Server {
 
     fn open_entry(&mut self, idx: usize) {
         let Some(e) = self.files.entries.get(idx).cloned() else { return };
+        if e.up {
+            self.files_up();
+            self.redraw_settings_surfaces();
+            return;
+        }
+        if e.dir {
+            self.enter_dir(e.path.clone());
+            self.redraw_settings_surfaces();
+            return;
+        }
         let lower = e.name.to_ascii_lowercase();
         log::info!("[deloxy-de] files: open '{}'", e.name);
         let Some(data) = Self::entry_data(&e) else {
@@ -1350,6 +1471,9 @@ impl Server {
             let m = self.files.status.clone();
             self.notify(&m);
             self.launch(Launch::Terminal);
+        } else if lower.ends_with(".ppm") && e.store && !self.files.cwd.is_empty() {
+            // wallpapers are looked up by flat name (initramfs, then the store root)
+            self.files.status = String::from("wallpapers must be in the top-level folder");
         } else if lower.ends_with(".ppm") {
             let mut t = self.theme;
             t.wall_file = [0; 32];
@@ -1367,17 +1491,24 @@ impl Server {
 
     fn delete_entry(&mut self, idx: usize) {
         let Some(e) = self.files.entries.get(idx).cloned() else { return };
-        self.files.status = if !e.store {
+        let top_level = self.files.cwd.is_empty();
+        self.files.status = if e.up {
+            String::from("select a file or folder first")
+        } else if !e.store {
             String::from("system files are read-only")
-        } else if crate::store::is_reserved(&e.name) || e.name == "de.conf" {
+        } else if (top_level && (crate::store::is_reserved(&e.name) || e.name == "de.conf")) || crate::store::is_reserved_path(&e.path) && top_level {
             String::from("this file is managed by the system")
         } else {
-            match crate::store::with(|s| s.delete(&e.name)) {
+            // a symlink (even one that points at a folder) is removed with unlink; a real folder needs rmdir
+            let is_link = matches!(crate::store::with(|s| s.stat(&e.path, false)), Ok(Ok(st)) if st.kind == crate::store::Kind::Symlink);
+            let r = if e.dir && !is_link { crate::store::with(|s| s.rmdir(&e.path)) } else { crate::store::with(|s| s.unlink(&e.path)) };
+            match r {
                 Ok(Ok(())) => {
                     log::info!("[deloxy-de] files: deleted '{}'", e.name);
                     self.notify(&alloc::format!("Deleted {}", e.name));
                     alloc::format!("deleted {}", e.name)
                 }
+                Ok(Err(crate::store::StoreErr::NotEmpty)) => String::from("folder is not empty"),
                 _ => String::from("delete failed"),
             }
         };
@@ -1399,6 +1530,8 @@ impl Server {
         } else if files_refresh_btn().contains(lx, ly) {
             self.refresh_files();
             self.files.status = String::from("refreshed");
+        } else if files_mkdir_btn().contains(lx, ly) {
+            self.new_folder();
         } else if files_up_btn().contains(lx, ly) {
             self.files.scroll = self.files.scroll.saturating_sub(FILE_ROWS / 2);
         } else if files_down_btn().contains(lx, ly) {
@@ -1439,6 +1572,7 @@ impl Server {
                             self.delete_entry(i);
                         }
                     }
+                    0x0E => self.files_up(),
                     _ => return,
                 }
                 if let Some(i) = self.files.sel {
@@ -2285,11 +2419,13 @@ fn fmt_size(n: u64) -> String {
 fn draw_files(s: &mut Surface, t: &Theme, pal: &Palette, f: &FilesState) {
     s.fill_rect(Rect::new(0, 0, FILES_W, FILES_H), pal.win_bg);
     let rad = t.radius().min(6);
-    for (r, txt) in [(files_open_btn(), "Open"), (files_del_btn(), "Delete"), (files_refresh_btn(), "Refresh")] {
+    for (r, txt) in [(files_open_btn(), "Open"), (files_del_btn(), "Delete"), (files_refresh_btn(), "Refresh"), (files_mkdir_btn(), "New folder")] {
         s.fill_round(r, rad, pal.widget);
         s.draw_text_centered(r, txt.as_bytes(), pal.text);
     }
-    s.draw_text(12, 38, b"Name", pal.text_dim, None);
+    let hdr = if f.cwd.is_empty() { String::from("Name   /") } else { alloc::format!("Name   {}", f.cwd) };
+    let hb = hdr.as_bytes();
+    s.draw_text(12, 38, &hb[..hb.len().min(34)], pal.text_dim, None);
     s.draw_text(300, 38, b"Size", pal.text_dim, None);
     s.draw_text(392, 38, b"Where", pal.text_dim, None);
     s.fill_rect(Rect::new(8, 55, 440, 1), pal.widget);
@@ -2303,6 +2439,16 @@ fn draw_files(s: &mut Surface, t: &Theme, pal: &Palette, f: &FilesState) {
         }
         let fg = if sel { rgb(255, 255, 255) } else { pal.text };
         let nm = e.name.as_bytes();
+        if e.dir {
+            let mut lbl = String::from(if e.up { "[ .. ]" } else { "[+] " });
+            if !e.up {
+                lbl.push_str(&e.name);
+            }
+            let lb = lbl.as_bytes();
+            s.draw_text(14, r.y + 3, &lb[..lb.len().min(34)], fg, None);
+            s.draw_text(392, r.y + 3, if e.up { b"up" } else { b"folder" }, if sel { fg } else { pal.text_dim }, None);
+            continue;
+        }
         s.draw_text(14, r.y + 3, &nm[..nm.len().min(34)], fg, None);
         s.draw_text(300, r.y + 3, fmt_size(e.size).as_bytes(), fg, None);
         s.draw_text(392, r.y + 3, if e.store { b"store" } else { b"system" }, if sel { fg } else { pal.text_dim }, None);

@@ -172,36 +172,54 @@ pub fn duplicate_handle(p: &Arc<Process>, a: A) -> u64 {
     1
 }
 pub fn get_proc_address(p: &Arc<Process>, a: A) -> u64 {
-    if a[1] < 0x10000 {
-        set_err(p, 127);
+    use crate::exec::pe::ImportRef;
+    let by_ordinal = a[1] < 0x10000;
+    let name = if by_ordinal { String::new() } else { String::from_utf8_lossy(&read_cstr(p, a[1], 256)).into_owned() };
+    // a DLL loaded from a file: its own export table (forwarders followed)
+    let imp = if by_ordinal { ImportRef::Ordinal(a[1] as u32) } else { ImportRef::Name(&name) };
+    match crate::exec::dll::proc_address(p, a[0], imp) {
+        Some(Some(addr)) => return addr,
+        Some(None) => {
+            set_err(p, crate::exec::dll::ERROR_PROC_NOT_FOUND);
+            return 0;
+        }
+        None => {}
+    }
+    if by_ordinal {
+        set_err(p, crate::exec::dll::ERROR_PROC_NOT_FOUND);
         return 0;
     }
-    let name = String::from_utf8_lossy(&read_cstr(p, a[1], 256)).into_owned();
     for dll in ["msvcrt", "kernel32", "ws2_32"] {
         if let Some(addr) = super::nt::resolve(dll, &name) {
             return addr;
         }
     }
-    set_err(p, 127); // ERROR_PROC_NOT_FOUND
+    set_err(p, crate::exec::dll::ERROR_PROC_NOT_FOUND);
     0
-}
-const KNOWN_DLLS: &[&str] = &["kernel32", "kernelbase", "ntdll", "msvcrt", "ucrtbase", "vcruntime140", "ws2_32", "wsock32", "advapi32", "api-ms-win-core", "api-ms-win-crt"];
-fn known_dll(n: &str) -> bool {
-    let l = n.to_ascii_lowercase();
-    let l = l.trim_end_matches(".dll");
-    KNOWN_DLLS.iter().any(|k| l == *k || l.starts_with(k))
 }
 pub fn get_module_handle_w(p: &Arc<Process>, a: A) -> u64 {
     if a[0] == 0 {
         return p.foreign.lock().image_base;
     }
-    if known_dll(&to_utf8(&read_wstr(p, a[0], 128))) { 0x7FF0_0000_0000 } else { set_err(p, 126); 0 }
+    match crate::exec::dll::module_handle(p, &to_utf8(&read_wstr(p, a[0], 260))) {
+        Some(h) => h,
+        None => {
+            set_err(p, crate::exec::dll::ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
 pub fn get_module_handle_a(p: &Arc<Process>, a: A) -> u64 {
     if a[0] == 0 {
         return p.foreign.lock().image_base;
     }
-    if known_dll(&String::from_utf8_lossy(&read_cstr(p, a[0], 128))) { 0x7FF0_0000_0000 } else { set_err(p, 126); 0 }
+    match crate::exec::dll::module_handle(p, &String::from_utf8_lossy(&read_cstr(p, a[0], 260))) {
+        Some(h) => h,
+        None => {
+            set_err(p, crate::exec::dll::ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
 pub fn get_module_handle_ex_w(p: &Arc<Process>, a: A) -> u64 {
     let h = get_module_handle_w(p, [a[1], 0, 0, 0]);
@@ -210,11 +228,152 @@ pub fn get_module_handle_ex_w(p: &Arc<Process>, a: A) -> u64 {
     }
     (h != 0) as u64
 }
+fn load_library_path(p: &Arc<Process>, path: &str) -> u64 {
+    match crate::exec::dll::load_library(p, path) {
+        Ok(h) => h,
+        Err(code) => {
+            set_err(p, code);
+            0
+        }
+    }
+}
 pub fn load_library_a(p: &Arc<Process>, a: A) -> u64 {
-    get_module_handle_a(p, a)
+    if a[0] == 0 {
+        set_err(p, 87);
+        return 0;
+    }
+    load_library_path(p, &String::from_utf8_lossy(&read_cstr(p, a[0], 260)))
 }
 pub fn load_library_w(p: &Arc<Process>, a: A) -> u64 {
-    get_module_handle_w(p, a)
+    if a[0] == 0 {
+        set_err(p, 87);
+        return 0;
+    }
+    load_library_path(p, &to_utf8(&read_wstr(p, a[0], 260)))
+}
+// ------------------------------------------------------------ VirtualQuery / VirtualProtect ---
+
+fn prot_of(f: crate::mm::vmm::VmFlags) -> u32 {
+    if f.contains(crate::mm::vmm::VmFlags::EXEC) {
+        if f.contains(crate::mm::vmm::VmFlags::WRITE) { 0x40 } else { 0x20 }
+    } else if f.contains(crate::mm::vmm::VmFlags::WRITE) {
+        0x04
+    } else {
+        0x02
+    }
+}
+
+fn in_image(p: &Arc<Process>, va: u64) -> bool {
+    let g = p.foreign.lock();
+    (va >= g.image_base && va < g.brk_base_hint) || g.modules.iter().any(|m| va >= m.base && va < m.base + m.size)
+}
+
+/// VirtualQuery(addr, MEMORY_BASIC_INFORMATION*, len): the run of pages around `addr` that share one protection.
+pub fn virtual_query(p: &Arc<Process>, a: A) -> u64 {
+    const PAGE: u64 = 4096;
+    if a[2] < 48 {
+        set_err(p, 24); // ERROR_BAD_LENGTH
+        return 0;
+    }
+    let page = a[0] & !(PAGE - 1);
+    let first = { p.space.lock().as_mut().and_then(|sp| sp.query(x86_64::VirtAddr::new(page)).map(|q| q.1)) };
+    let mut rec = [0u8; 48];
+    match first {
+        None => {
+            rec[0..8].copy_from_slice(&page.to_le_bytes());
+            rec[24..32].copy_from_slice(&PAGE.to_le_bytes());
+            rec[32..36].copy_from_slice(&0x10000u32.to_le_bytes()); // MEM_FREE
+            rec[36..40].copy_from_slice(&1u32.to_le_bytes()); // PAGE_NOACCESS
+        }
+        Some(f) => {
+            let prot = prot_of(f);
+            let mut start = page;
+            let mut end = page + PAGE;
+            let same = |pg: u64| p.space.lock().as_mut().and_then(|sp| sp.query(x86_64::VirtAddr::new(pg)).map(|q| prot_of(q.1))) == Some(prot);
+            while end - page < 1024 * PAGE && same(end) {
+                end += PAGE;
+            }
+            while page - start < 1024 * PAGE && start > 0 && same(start - PAGE) {
+                start -= PAGE;
+            }
+            let ty: u32 = if in_image(p, page) { 0x0100_0000 } else { 0x0002_0000 };
+            rec[0..8].copy_from_slice(&start.to_le_bytes());
+            rec[8..16].copy_from_slice(&start.to_le_bytes());
+            rec[16..20].copy_from_slice(&prot.to_le_bytes());
+            rec[24..32].copy_from_slice(&(end - start).to_le_bytes());
+            rec[32..36].copy_from_slice(&0x1000u32.to_le_bytes()); // MEM_COMMIT
+            rec[36..40].copy_from_slice(&prot.to_le_bytes());
+            rec[40..44].copy_from_slice(&ty.to_le_bytes());
+        }
+    }
+    let _ = copy_to_user(p, a[1], &rec);
+    48
+}
+
+/// VirtualProtect(addr, size, newProtect, *oldProtect). W^X: PAGE_EXECUTE_READWRITE is honoured only for pages that
+/// are already executable image code (self-patching such as MinGW's pseudo-relocations); elsewhere it means RW.
+pub fn virtual_protect(p: &Arc<Process>, a: A) -> u64 {
+    use crate::mm::vmm::VmFlags;
+    const PAGE: u64 = 4096;
+    let (addr, size, new) = (a[0], a[1].max(1), a[2] as u32);
+    let first = addr & !(PAGE - 1);
+    let last = (addr + size - 1) & !(PAGE - 1);
+    if (last - first) / PAGE > 4096 {
+        set_err(p, 87);
+        return 0;
+    }
+    let mut old = 0u32;
+    let mut pg = first;
+    while pg <= last {
+        let cur = { p.space.lock().as_mut().and_then(|sp| sp.query(x86_64::VirtAddr::new(pg)).map(|q| q.1)) };
+        let Some(cur) = cur else {
+            set_err(p, 487); // ERROR_INVALID_ADDRESS
+            return 0;
+        };
+        if pg == first {
+            old = prot_of(cur);
+        }
+        let want = match new & 0xFF {
+            0x01 | 0x02 => VmFlags::USER,
+            0x04 | 0x08 => VmFlags::USER | VmFlags::WRITE,
+            0x10 | 0x20 | 0x80 => VmFlags::USER | VmFlags::EXEC,
+            0x40 => {
+                if cur.contains(VmFlags::EXEC) && in_image(p, pg) {
+                    VmFlags::USER | VmFlags::WRITE | VmFlags::EXEC
+                } else {
+                    VmFlags::USER | VmFlags::WRITE
+                }
+            }
+            _ => {
+                set_err(p, 87);
+                return 0;
+            }
+        };
+        // never turn data pages executable
+        let want = if want.contains(VmFlags::EXEC) && !cur.contains(VmFlags::EXEC) && !in_image(p, pg) {
+            if want.contains(VmFlags::WRITE) { VmFlags::USER | VmFlags::WRITE } else { VmFlags::USER }
+        } else {
+            want
+        };
+        if p.space.lock().as_mut().map_or(true, |sp| sp.protect(x86_64::VirtAddr::new(pg), want).is_err()) {
+            set_err(p, 5);
+            return 0;
+        }
+        pg += PAGE;
+    }
+    if a[3] != 0 {
+        let _ = copy_to_user(p, a[3], &old.to_le_bytes());
+    }
+    1
+}
+
+pub fn free_library(p: &Arc<Process>, a: A) -> u64 {
+    if crate::exec::dll::free_library(p, a[0]) {
+        1
+    } else {
+        set_err(p, crate::exec::dll::ERROR_INVALID_HANDLE);
+        0
+    }
 }
 
 // ------------------------------------------------------------ exceptions / SList ---
@@ -319,6 +478,12 @@ pub fn delete_file_w(p: &Arc<Process>, a: A) -> u64 {
 }
 pub fn create_directory_w(p: &Arc<Process>, a: A) -> u64 {
     super::win32::create_directory(p, [narrow(p, a[0], 0), 0, 0, 0])
+}
+pub fn remove_directory_w(p: &Arc<Process>, a: A) -> u64 {
+    super::win32::remove_directory(p, [narrow(p, a[0], 0), 0, 0, 0])
+}
+pub fn move_file_w(p: &Arc<Process>, a: A) -> u64 {
+    super::win32::move_file(p, [narrow(p, a[0], 0), narrow(p, a[1], 1), 0, 0])
 }
 pub fn get_module_file_name_w(p: &Arc<Process>, a: A) -> u64 {
     let tmp = scratch(p, 1);

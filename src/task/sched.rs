@@ -395,6 +395,38 @@ pub fn futex_wake(key: u64, n: usize) -> usize {
     woken
 }
 
+/// Wake one thread (by tid) if it is blocked on a futex (thread-directed signal).
+pub fn futex_interrupt_tid(tid: u64) -> bool {
+    let mut s = SCHED.lock();
+    if let Some(i) = s.futex.iter().position(|(_, t)| t.tid == tid) {
+        let (_, t) = s.futex.remove(i);
+        t.set_state(READY);
+        s.ready.push_back(t);
+        return true;
+    }
+    false
+}
+
+/// A signal became deliverable for process `pid`: make its futex waiters runnable so they notice it (the woken syscall
+/// sees `signals::interrupted` and returns EINTR/ERESTART; a woken waiter that finds no signal just returns 0, which
+/// FUTEX_WAIT allows as a spurious wake-up). Returns how many threads were woken.
+pub fn futex_interrupt(pid: u64) -> usize {
+    let mut s = SCHED.lock();
+    let mut woken = 0;
+    let mut i = 0;
+    while i < s.futex.len() {
+        if s.futex[i].1.process.pid == pid {
+            let (_, t) = s.futex.remove(i);
+            t.set_state(READY);
+            s.ready.push_back(t);
+            woken += 1;
+        } else {
+            i += 1;
+        }
+    }
+    woken
+}
+
 static CUR_FS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CUR_GS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

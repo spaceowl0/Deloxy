@@ -7,6 +7,7 @@
 
 pub mod elf;
 pub mod pe;
+pub mod dll;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -89,6 +90,14 @@ pub struct Plan {
     pub main_entry: u64,
     /// AT_BASE: load address of the interpreter
     pub at_base: u64,
+    /// PE: segments of the DLLs the program imports (file offsets index the combined buffer: exe bytes + `dll_bytes`)
+    pub extra_segments: Vec<Segment>,
+    /// PE: the DLL files' bytes, in the order their segments were planned
+    pub dll_bytes: Option<Vec<Vec<u8>>>,
+    /// PE: modules to register in the new process
+    pub modules: Vec<pe::Module>,
+    /// PE: (hinst, DllMain) pairs run before the entry point, dependencies first
+    pub dll_init: Vec<(u64, u64)>,
 }
 
 /// Where the dynamic linker is mapped (between the program and the mmap area).
@@ -115,7 +124,7 @@ fn validate(plan: &Plan, data_len: usize) -> Result<(), ExecError> {
         return Err(ExecError::Format("no loadable segments"));
     }
     let mut total_pages = 0u64;
-    for s in &plan.segments {
+    for s in plan.segments.iter().chain(plan.extra_segments.iter()) {
         if s.mem_len == 0 || !is_user_range(s.va, s.mem_len) {
             return Err(ExecError::BadRange);
         }
@@ -137,7 +146,7 @@ fn validate(plan: &Plan, data_len: usize) -> Result<(), ExecError> {
         }
     }
     // byte-range overlap (sorted copy of (start, end))
-    let mut ranges: Vec<(u64, u64)> = plan.segments.iter().map(|s| (s.va, s.va + s.mem_len)).collect();
+    let mut ranges: Vec<(u64, u64)> = plan.segments.iter().chain(plan.extra_segments.iter()).map(|s| (s.va, s.va + s.mem_len)).collect();
     ranges.sort_unstable();
     for w in ranges.windows(2) {
         if w[0].1 > w[1].0 {
@@ -200,12 +209,19 @@ fn prepare_plan(data: &[u8]) -> Result<(Plan, Option<Vec<u8>>), ExecError> {
     let mut plan = if data.len() >= 4 && &data[..4] == b"\x7fELF" {
         elf::plan(data)?
     } else if data.len() >= 2 && &data[..2] == b"MZ" {
-        pe::plan(data)?
+        pe::plan(data, &dll::find_dll_bytes)?
     } else {
         return Err(ExecError::BadMagic);
     };
     let main_len = data.len();
     let mut combined: Option<Vec<u8>> = None;
+    if let Some(blobs) = plan.dll_bytes.take() {
+        let mut c = data.to_vec();
+        for b in blobs {
+            c.extend_from_slice(&b);
+        }
+        combined = Some(c);
+    }
     if let Some(path) = plan.interp.clone() {
         // dynamic program: map the interpreter (ld.so) next to it; ld.so loads the libraries and relocates everything
         let f = crate::abi::vfs::system_lib(&path).ok_or(ExecError::Unsupported("dynamic linker not found in the image"))?;
@@ -275,7 +291,7 @@ fn build_into(proc: Arc<Process>, name: &str, data: &[u8], main_len: usize, plan
 
     // Page permissions: union of every segment touching the page.
     let mut pages: BTreeMap<u64, u8> = BTreeMap::new();
-    for s in &plan.segments {
+    for s in plan.segments.iter().chain(plan.extra_segments.iter()) {
         let mut pg = page_of(s.va);
         let last = page_of(s.va + s.mem_len - 1);
         while pg <= last {
@@ -305,7 +321,7 @@ fn build_into(proc: Arc<Process>, name: &str, data: &[u8], main_len: usize, plan
     }
     flush(run_start, run_len)?;
 
-    for s in &plan.segments {
+    for s in plan.segments.iter().chain(plan.extra_segments.iter()) {
         if s.file_len > 0 {
             write_user(&proc, s.va, &data[s.file_off..s.file_off + s.file_len])?;
         }
@@ -411,7 +427,8 @@ fn build_into(proc: Arc<Process>, name: &str, data: &[u8], main_len: usize, plan
             (rsp, 0, teb)
         }
     };
-    Ok(Built { proc, rip: plan.entry, rsp, arg0, gs })
+    let rip = if plan.abi == AbiKind::Nt && !plan.dll_init.is_empty() { nt::START_VA } else { plan.entry };
+    Ok(Built { proc, rip, rsp, arg0, gs })
 }
 
 fn unsafe_words(h: &[u64]) -> Vec<u8> {

@@ -20,6 +20,27 @@ use x86_64::VirtAddr;
 pub const NT_THUNK_BASE: u64 = 0x0000_7FFE_0000_0000;
 pub const NT_DATA_BASE: u64 = NT_THUNK_BASE + 4 * PAGE_SIZE; // TEB, PEB, strings, msvcrt globals (4 pages)
 pub const DATA_PAGE3: u64 = NT_DATA_BASE + 3 * PAGE_SIZE;
+/// User-mode continuation that runs queued DllMain calls after a LoadLibrary/FreeLibrary syscall.
+pub const CONT_VA: u64 = NT_THUNK_BASE + 0x3E00;
+/// Process entry used when DLLs are linked in: runs every DllMain(ATTACH), then jumps to the real entry.
+pub const START_VA: u64 = NT_THUNK_BASE + 0x3F00;
+/// PEB page + 0x400: queued `{entry, hinst, reason}` records; + 0x3F0: the executable's real entry point.
+pub const LIST_VA: u64 = NT_DATA_BASE + PAGE_SIZE + 0x400;
+pub const ENTRY_SLOT_VA: u64 = NT_DATA_BASE + PAGE_SIZE + 0x3F0;
+
+/// machine code of the two stubs above (assembled from tools/asm; see exec/dll.rs)
+static CONT_CODE: [u8; 60] = [0x53, 0x56, 0x48, 0x89, 0xC6, 0x4C, 0x89, 0xC3, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x03, 0x48, 0x85, 0xC0, 0x74, 0x1E, 0x48, 0x8B, 0x4B, 0x08, 0x8B, 0x53, 0x10, 0x45, 0x31, 0xC0, 0xFF, 0xD0, 0x83, 0x7B, 0x10, 0x01, 0x75, 0x06, 0x85, 0xC0, 0x75, 0x02, 0x31, 0xF6, 0x48, 0x83, 0xC3, 0x18, 0xEB, 0xDA, 0x48, 0x89, 0xF0, 0x48, 0x83, 0xC4, 0x28, 0x5E, 0x5B, 0xC3];
+static START_CODE: [u8; 59] = [0x48, 0x83, 0xEC, 0x28, 0x48, 0xBB, 0x00, 0x54, 0x00, 0x00, 0xFE, 0x7F, 0x00, 0x00, 0x48, 0x8B, 0x03, 0x48, 0x85, 0xC0, 0x74, 0x12, 0x48, 0x8B, 0x4B, 0x08, 0x8B, 0x53, 0x10, 0x45, 0x31, 0xC0, 0xFF, 0xD0, 0x48, 0x83, 0xC3, 0x18, 0xEB, 0xE6, 0x48, 0x83, 0xC4, 0x28, 0x48, 0xB8, 0xF0, 0x53, 0x00, 0x00, 0xFE, 0x7F, 0x00, 0x00, 0x48, 0x8B, 0x00, 0xFF, 0xE0];
+
+/// Is `dll` one of the built-in system DLLs whose imports the shim table serves?
+pub fn is_system_dll(dll: &str) -> bool {
+    let d = dll.as_bytes();
+    let d = if d.len() > 4 && d[d.len() - 4..].eq_ignore_ascii_case(b".dll") { &d[..d.len() - 4] } else { d };
+    let low: alloc::string::String = alloc::string::String::from_utf8_lossy(d).to_ascii_lowercase();
+    low == "bcrypt" || low == "kernel32" || low == "kernelbase" || low == "ntdll" || low == "advapi32" || low.starts_with("api-ms-win-core")
+        || low == "msvcrt" || low == "ucrtbase" || low == "vcruntime140" || low.starts_with("api-ms-win-crt")
+        || low == "ws2_32" || low == "wsock32"
+}
 
 const STD_INPUT: u64 = 4;
 const STD_OUTPUT: u64 = 8;
@@ -116,6 +137,9 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("InterlockedAnd", x::interlocked_and),
     ("InterlockedOr", x::interlocked_or),
     ("RaiseException", x::raise_exception),
+    ("AddVectoredExceptionHandler", super::win_exc::add_veh),
+    ("RemoveVectoredExceptionHandler", super::win_exc::remove_veh),
+    ("__DeloxyExcReturn", super::win_exc::exc_return_stub),
     ("UnhandledExceptionFilter", x::zero),
     ("RtlCaptureContext", x::rtl_capture_context),
     ("RtlLookupFunctionEntry", x::zero),
@@ -128,7 +152,8 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("LoadLibraryW", x::load_library_w),
     ("LoadLibraryExA", x::load_library_a),
     ("LoadLibraryExW", x::load_library_w),
-    ("FreeLibrary", x::one),
+    ("FreeLibrary", x::free_library),
+    ("DisableThreadLibraryCalls", x::one),
     ("LocalAlloc", x::local_alloc),
     ("GlobalAlloc", x::local_alloc),
     ("LocalFree", x::local_free),
@@ -148,6 +173,8 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("GetFileAttributesW", x::get_file_attributes_w),
     ("DeleteFileW", x::delete_file_w),
     ("CreateDirectoryW", x::create_directory_w),
+    ("RemoveDirectoryW", x::remove_directory_w),
+    ("MoveFileW", x::move_file_w),
     ("GetModuleFileNameW", x::get_module_file_name_w),
     ("GetFullPathNameA", x::get_full_path_name_a),
     ("GetLongPathNameA", x::get_full_path_name_a),
@@ -385,13 +412,13 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("GetCurrentProcessId", get_pid),
     ("GetCurrentThreadId", get_tid),
     ("GetCurrentProcess", get_current_process),
-    ("SetUnhandledExceptionFilter", zero),
+    ("SetUnhandledExceptionFilter", super::win_exc::set_filter),
     ("TerminateProcess", terminate_process),
     ("IsDBCSLeadByteEx", zero),
     ("MultiByteToWideChar", c::multi_byte_to_wide),
     ("WideCharToMultiByte", c::wide_to_multi_byte),
-    ("VirtualProtect", one),
-    ("VirtualQuery", zero),
+    ("VirtualProtect", x::virtual_protect),
+    ("VirtualQuery", x::virtual_query),
     // ---- msvcrt ----
     ("__getmainargs", c::getmainargs),
     ("__set_app_type", zero),
@@ -493,6 +520,8 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("GetLocalTime", w32::get_local_time),
     ("GetSystemTime", w32::get_local_time),
     ("CreateDirectoryA", w32::create_directory),
+    ("RemoveDirectoryA", w32::remove_directory),
+    ("MoveFileA", w32::move_file),
     ("lstrlenA", c::strlen),
     ("lstrcpyA", c::strcpy),
     ("lstrcmpA", c::strcmp),
@@ -744,6 +773,13 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
         let nr = SHIMS.iter().position(|(n, _)| n == name).map(|i| i as u32 + 1).unwrap_or(0);
         page.extend_from_slice(&float_stub(*kind, nr));
     }
+    let exc_nr = SHIMS.iter().position(|(n, _)| *n == "__DeloxyExcReturn").map(|i| i as u32 + 1).unwrap_or(0);
+    page.resize((super::win_exc::EXC_RET_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&super::win_exc::exc_ret_stub(exc_nr));
+    page.resize((CONT_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&CONT_CODE);
+    page.resize((START_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&START_CODE);
     write_user(p, NT_THUNK_BASE, &page)?;
     {
         let mut g = p.space.lock();
@@ -783,6 +819,25 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
         write_user(p, index_va, &0u32.to_le_bytes())?;
     }
     p.foreign.lock().tls_tmpl = plan.tls;
+    {
+        // DLLs linked in by the loader: remember them, queue their DllMain(ATTACH) calls for the start stub
+        let mut g = p.foreign.lock();
+        g.modules = plan.modules.clone();
+        g.image_base = plan.image_base;
+        g.brk_base_hint = plan.segments.iter().map(|s| s.va + s.mem_len).max().unwrap_or(plan.image_base);
+        g.dll_next = plan.modules.iter().map(|m| m.base + ((m.size + 0xFFFF) & !0xFFFF)).max().unwrap_or(0).max(crate::exec::pe::DLL_REGION);
+    }
+    if !plan.dll_init.is_empty() {
+        let mut list: Vec<u8> = Vec::new();
+        for &(hinst, entry) in plan.dll_init.iter().take(40) {
+            list.extend_from_slice(&entry.to_le_bytes());
+            list.extend_from_slice(&hinst.to_le_bytes());
+            list.extend_from_slice(&1u64.to_le_bytes());
+        }
+        list.extend_from_slice(&[0u8; 8]);
+        write_user(p, LIST_VA, &list)?;
+        w64(ENTRY_SLOT_VA, plan.entry)?;
+    }
     w64(peb + 0x10, plan.image_base)?; // ImageBaseAddress
 
     let mut cmd: Vec<u8> = Vec::new();
@@ -834,7 +889,21 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     let args = [f.r10, f.rdx, f.r8, f.r9];
     p.foreign.lock().nt_rsp = f.rsp;
     match SHIMS.get(idx) {
-        Some((_, func)) => func(&p, args) as i64,
+        Some((name, func)) => {
+            // exceptions need the whole frame (they may resume with a different register set)
+            if *name == "RaiseException" {
+                super::win_exc::raise(&p, f, args);
+            } else if *name == "__DeloxyExcReturn" {
+                super::win_exc::exc_return(&p, f, args[0]);
+            }
+            let r = func(&p, args) as i64;
+            if core::mem::take(&mut p.foreign.lock().pending_init) {
+                // run the queued DllMain calls in user mode, then return to the caller with `r` (see exec/dll.rs)
+                f.rip = CONT_VA;
+                f.r8 = LIST_VA;
+            }
+            r
+        }
         None => {
             if p.foreign.lock().first_warning(f.rax as u16) {
                 log::warn!("nt: unknown shim number {} in pid {}", f.rax, p.pid);

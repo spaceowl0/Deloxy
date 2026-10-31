@@ -326,6 +326,10 @@ pub struct Thread {
     /// User FS/GS base (Linux TLS via arch_prctl, NT TEB); restored on every switch.
     pub(crate) fs_base: AtomicU64,
     pub(crate) gs_base: AtomicU64,
+    /// Linux signal mask of this thread (`u64::MAX` = never set: inherit the process-level mask on first use)
+    pub(crate) sigmask: AtomicU64,
+    /// signals sent to this thread only (tkill/tgkill/pthread_kill)
+    pub(crate) tpending: AtomicU64,
     pub is_idle: bool,
 }
 
@@ -377,6 +381,8 @@ pub fn init() {
         wake_at: AtomicU64::new(0),
         fs_base: AtomicU64::new(0),
         gs_base: AtomicU64::new(0),
+        sigmask: AtomicU64::new(u64::MAX),
+        tpending: AtomicU64::new(0),
         is_idle: true,
     });
     sched::install_idle(idle);
@@ -388,7 +394,7 @@ fn create_thread(process: &Arc<Process>, name: &str, f: Box<dyn FnOnce() + Send>
     // SAFETY: `top` is the aligned end of a freshly mapped, unused kernel stack.
     let rsp = unsafe { crate::arch::x86_64::context::prepare_stack(top, sched::thread_start) };
     process.live_threads.fetch_add(1, Ordering::SeqCst);
-    Some(Arc::new(Thread {
+    let t = Arc::new(Thread {
         tid: NEXT_TID.fetch_add(1, Ordering::SeqCst),
         name: String::from(name),
         process: process.clone(),
@@ -401,8 +407,23 @@ fn create_thread(process: &Arc<Process>, name: &str, f: Box<dyn FnOnce() + Send>
         wake_at: AtomicU64::new(0),
         fs_base: AtomicU64::new(0),
         gs_base: AtomicU64::new(0),
+        sigmask: AtomicU64::new(u64::MAX),
+        tpending: AtomicU64::new(0),
         is_idle: false,
-    }))
+    });
+    {
+        let mut reg = THREADS.lock();
+        reg.retain(|w| w.strong_count() > 0);
+        reg.push(Arc::downgrade(&t));
+    }
+    Some(t)
+}
+
+/// Registry of live threads, for tid lookups (tkill/tgkill).
+static THREADS: IrqMutex<Vec<alloc::sync::Weak<Thread>>> = IrqMutex::new(Vec::new());
+
+pub fn find_thread(tid: u64) -> Option<Arc<Thread>> {
+    THREADS.lock().iter().filter_map(|w| w.upgrade()).find(|t| t.tid == tid)
 }
 
 /// Start a kernel thread (runs in the kernel process, kernel address space).

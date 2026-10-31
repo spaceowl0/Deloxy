@@ -84,8 +84,8 @@ fn syscall_inner(f: &mut SyscallFrame) -> i64 {
         33 | 292 => sys_dup2(&p, a0, a1),
         7 => sys_poll(&p, a0, a1, a2 as i32),
         271 => sys_ppoll(&p, a0, a1, a2),
-        200 => super::linux_proc::kill(&p, a0, a1),          // tkill(tid, sig): tid == pid for the main thread
-        234 => super::linux_proc::kill(&p, a0, a2),          // tgkill(tgid, tid, sig)
+        200 => super::linux_proc::tgkill(&p, None, a0, a1),   // tkill(tid, sig)
+        234 => super::linux_proc::tgkill(&p, Some(a0), a1, a2), // tgkill(tgid, tid, sig)
         13 => super::signals::rt_sigaction(&p, a0, a1, a2, a3),
         14 => super::signals::rt_sigprocmask(&p, a0, a1, a2, a3),
         15 => super::signals::rt_sigreturn(&p, f),
@@ -96,6 +96,7 @@ fn syscall_inner(f: &mut SyscallFrame) -> i64 {
         127 => super::signals::rt_sigpending(&p, a0, a1),
         128 => super::signals::rt_sigtimedwait(&p, a0, a1, a2, a3),
         130 => super::signals::rt_sigsuspend(&p, a0, a1),
+        131 => super::signals::sigaltstack(&p, a0, a1),
         222 => super::signals::timer_create(&p, a0, a1, a2),
         223 => super::signals::timer_settime(&p, a0, a1, a2, a3),
         224 => super::signals::timer_gettime(&p, a0, a1),
@@ -124,7 +125,14 @@ fn syscall_inner(f: &mut SyscallFrame) -> i64 {
         21 => sys_access(&p, a0),
         79 => sys_getcwd(&p, a0, a1),
         72 => sys_fcntl(&p, a0, a1, a2),
-        110 => 1,
+        // process groups and sessions
+        111 => super::signals::pgid_of(&p) as i64, // getpgrp
+        121 => super::linux_proc::getpgid(&p, a0, false), // getpgid(pid)
+        124 => super::linux_proc::getpgid(&p, a0, true),  // getsid(pid)
+        109 => super::linux_proc::setpgid(&p, a0, a1),    // setpgid(pid, pgid)
+        112 => super::linux_proc::setsid(&p),             // setsid()
+        // getppid: the forking parent while it lives, otherwise 1 (the shell / init)
+        110 => p.foreign.lock().parent.as_ref().and_then(|w| w.upgrade()).filter(|q| !q.has_exited()).map_or(1, |q| q.pid as i64),
         57 => super::linux_proc::fork(&p, f, 0, false),
         58 => super::linux_proc::fork(&p, f, 0, true),
         59 => super::linux_proc::execve(&p, f, a0, a1, a2),
@@ -145,6 +153,13 @@ fn syscall_inner(f: &mut SyscallFrame) -> i64 {
         12 => sys_brk(&p, a0),
         16 => sys_ioctl(&p, a0, a1, a2),
         20 => sys_writev(&p, a0, a1, a2),
+        88 => sys_symlinkat(&p, a0, AT_FDCWD as u64, a1),
+        266 => sys_symlinkat(&p, a0, a1, a2),
+        86 | 265 => -1, // link/linkat: no hard links (EPERM)
+        90 => sys_chmod_at(&p, AT_FDCWD as u64, a0, a1),
+        268 => sys_chmod_at(&p, a0, a1, a2),
+        91 => sys_fchmod(&p, a0, a1),
+        76 => sys_truncate(&p, a0, a1),
         89 => sys_readlinkat(&p, AT_FDCWD as u64, a0, a1, a2),
         267 => sys_readlinkat(&p, a0, a1, a2, a3),
         269 | 439 => sys_access_at(&p, a0, a1),
@@ -562,6 +577,7 @@ fn sys_read(p: &Arc<Process>, fd: u64, buf: u64, len: u64) -> i64 {
                 Ok(()) => v.len() as i64,
                 Err(e) => -e,
             },
+            Err(e) if e == super::STDIN_INTR => -super::signals::ERESTART,
             Err(_) => 0,
         };
     };
@@ -708,6 +724,22 @@ fn sys_lseek(p: &Arc<Process>, fd: u64, off: u64, whence: u64) -> i64 {
     }
 }
 
+/// `struct stat` for a persistent-store inode: real type bits, permission bits, size, mtime and inode number.
+fn stat_from_store(st: &crate::store::Stat) -> [u8; 144] {
+    let ty = match st.kind {
+        crate::store::Kind::File => 0o100000,
+        crate::store::Kind::Dir => 0o040000,
+        crate::store::Kind::Symlink => 0o120000,
+    };
+    let mut b = stat_buf(ty | st.mode as u32, st.size);
+    b[0..8].copy_from_slice(&0x802u64.to_le_bytes());
+    b[8..16].copy_from_slice(&(st.ino as u64).to_le_bytes());
+    for off in [72usize, 88, 104] {
+        b[off..off + 8].copy_from_slice(&st.mtime.to_le_bytes());
+    }
+    b
+}
+
 fn stat_buf(mode: u32, size: u64) -> [u8; 144] {
     let mut st = [0u8; 144];
     st[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
@@ -738,6 +770,11 @@ fn sys_fstat(p: &Arc<Process>, fd: u64, buf: u64) -> i64 {
             let g = p.foreign.lock();
             match g.fds.get(i).and_then(|s| s.as_ref()) {
                 Some(f) if f.is_dir() => stat_buf(0o040755, 0),
+                Some(f) if vfs::pfs_stat_open(&f.name).is_some() => {
+                    let mut b = stat_from_store(&vfs::pfs_stat_open(&f.name).unwrap());
+                    b[48..56].copy_from_slice(&(f.len() as u64).to_le_bytes());
+                    b
+                }
                 Some(f) => with_ino(stat_buf(if f.name.ends_with(".elf") || f.name.contains(".so") || vfs::looks_executable(f.bytes()) { 0o100755 } else { 0o100644 }, f.len() as u64), &f.name),
                 None => return -EBADF,
             }
@@ -752,6 +789,9 @@ fn sys_fstat(p: &Arc<Process>, fd: u64, buf: u64) -> i64 {
 fn stat_for(f: &vfs::OpenFile) -> [u8; 144] {
     if f.is_dir() {
         return with_ino(stat_buf(0o040755, 0), &f.name);
+    }
+    if let Some(st) = vfs::pfs_stat_open(&f.name) {
+        return stat_from_store(&st);
     }
     with_ino(stat_buf(if f.name.ends_with(".elf") || f.name.contains(".so") || vfs::looks_executable(f.bytes()) { 0o100755 } else { 0o100644 }, f.len() as u64), &f.name)
 }
@@ -782,6 +822,15 @@ fn sys_stat_at_nf(p: &Arc<Process>, dirfd: u64, path: u64, buf: u64, nofollow: b
         Err(e) => return -e,
     };
     let abs = vfs::resolve_abs(p, &path);
+    if let Some(r) = vfs::pfs_stat(p, &abs, !nofollow) {
+        return match r {
+            Ok(st) => match copy_to_user(p, buf, &stat_from_store(&st)) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            },
+            Err(e) => -e,
+        };
+    }
     if nofollow {
         if let Some(t) = symlink_target(&abs) {
             return match copy_to_user(p, buf, &with_ino(stat_buf(0o120777, t.len() as u64), &alloc::format!("/{}", abs))) {
@@ -898,6 +947,18 @@ fn sys_readlinkat(p: &Arc<Process>, dirfd: u64, path: u64, buf: u64, size: u64) 
         Err(e) => return -e,
     };
     let abs = vfs::resolve_abs(p, &s);
+    if let Some(r) = vfs::readlink_pfs(p, &abs) {
+        return match r {
+            Ok(t) => {
+                let n = t.len().min(size as usize);
+                match copy_to_user(p, buf, &t.as_bytes()[..n]) {
+                    Ok(()) => n as i64,
+                    Err(e) => -e,
+                }
+            }
+            Err(e) => -e,
+        };
+    }
     let target: Option<alloc::string::String> = if abs == "proc/self/exe" {
         Some(alloc::format!("/bin/{}", p.foreign.lock().prog_name))
     } else if let Some((parent, name)) = abs.rsplit_once('/') {
@@ -916,6 +977,72 @@ fn sys_readlinkat(p: &Arc<Process>, dirfd: u64, path: u64, buf: u64, size: u64) 
         None => {
             if vfs::open(p, &s, false, false, false, false).is_ok() || vfs::is_dir_abs(p, &abs) { -EINVAL } else { -ENOENT }
         }
+    }
+}
+
+fn sys_symlinkat(p: &Arc<Process>, target: u64, newdirfd: u64, linkpath: u64) -> i64 {
+    let t = match user_cstr(p, target) {
+        Ok(s) => s,
+        Err(e) => return -e,
+    };
+    let l = match user_path_at(p, newdirfd, linkpath) {
+        Ok(s) => s,
+        Err(e) => return -e,
+    };
+    match vfs::symlink(p, &t, &l) {
+        Ok(()) => 0,
+        Err(e) => -e,
+    }
+}
+
+fn sys_chmod_at(p: &Arc<Process>, dirfd: u64, path: u64, mode: u64) -> i64 {
+    let path = match user_path_at(p, dirfd, path) {
+        Ok(s) => s,
+        Err(e) => return -e,
+    };
+    match vfs::chmod(p, &path, mode as u32) {
+        Ok(()) => 0,
+        Err(e) => -e,
+    }
+}
+
+fn sys_fchmod(p: &Arc<Process>, fd: u64, mode: u64) -> i64 {
+    let fd = rd(p, fd);
+    let Some(i) = fd_slot(fd) else { return 0 };
+    let name = {
+        let g = p.foreign.lock();
+        match g.fds.get(i).and_then(|s| s.as_ref()) {
+            Some(f) => f.name.clone(),
+            None => return -EBADF,
+        }
+    };
+    match vfs::chmod_open(&name, mode as u32) {
+        Ok(()) => 0,
+        Err(e) => -e,
+    }
+}
+
+fn sys_truncate(p: &Arc<Process>, path: u64, len: u64) -> i64 {
+    let path = match user_cstr(p, path) {
+        Ok(s) => s,
+        Err(e) => return -e,
+    };
+    if len as usize > crate::store::MAX_FILE_BYTES {
+        return -EFBIG;
+    }
+    let mut f = match vfs::open(p, &path, true, false, false, false) {
+        Ok(f) => f,
+        Err(e) => return -e,
+    };
+    if let vfs::Data::Buf(v) = &mut f.data {
+        v.resize(len as usize, 0);
+        f.dirty = true;
+    } else {
+        return -EINVAL;
+    }
+    match vfs::flush(&mut f) {
+        Ok(()) => 0,
+        Err(e) => -e,
     }
 }
 
@@ -1229,7 +1356,15 @@ fn sys_futex(p: &Arc<Process>, uaddr: u64, op: u64, val: u64, timeout: u64) -> i
                 return -EAGAIN;
             }
             if timeout == 0 {
-                task::sched::futex_block(key); // woken by FUTEX_WAKE (or CLEARTID at thread exit)
+                // a deliverable signal interrupts the wait (restarted after a SA_RESTART handler; the restart re-checks the
+                // value, so a wake-up that raced with the signal is not lost)
+                if super::signals::interrupted(p) {
+                    return -super::signals::ERESTART;
+                }
+                task::sched::futex_block(key); // woken by FUTEX_WAKE, CLEARTID at thread exit, or a signal
+                if super::signals::interrupted(p) {
+                    return -super::signals::ERESTART;
+                }
                 return 0;
             }
             let Some(mut ms) = timespec_ms(p, timeout) else { return -14 };
@@ -1242,6 +1377,9 @@ fn sys_futex(p: &Arc<Process>, uaddr: u64, op: u64, val: u64, timeout: u64) -> i
             loop {
                 if copy_from_user(p, &mut w, uaddr).is_ok() && u32::from_ne_bytes(w) != val as u32 {
                     return 0;
+                }
+                if super::signals::interrupted(p) {
+                    return -super::signals::EINTR; // timed waits are not restarted
                 }
                 if time::uptime_ms().saturating_sub(t0) >= ms {
                     return -110; // ETIMEDOUT

@@ -1047,13 +1047,38 @@ fn test_shell() {
 
 // ------------------------------------------------------------------ persistent store ---
 
+fn snap_store<D: crate::store::BlockDev>(st: &mut crate::store::Store<D>, dir: &str, out: &mut Vec<String>) {
+    use crate::store::{crc32, Kind};
+    for e in st.readdir(dir).unwrap() {
+        let p = alloc::format!("{}/{}", dir, e.name);
+        match e.kind {
+            Kind::Dir => {
+                out.push(alloc::format!("D {}", p));
+                snap_store(st, &p, out);
+            }
+            Kind::File => match st.read(&p) {
+                Ok(d) => out.push(alloc::format!("F {} {} {:08x}", p, e.size, crc32(&d))),
+                Err(_) => out.push(alloc::format!("F {} UNREADABLE", p)),
+            },
+            Kind::Symlink => out.push(alloc::format!("L {} -> {}", p, st.readlink(&p).unwrap())),
+        }
+    }
+}
+
+fn store_snapshot<D: crate::store::BlockDev>(st: &mut crate::store::Store<D>) -> Vec<String> {
+    let mut v = Vec::new();
+    snap_store(st, "", &mut v);
+    v
+}
+
 fn test_store_logic() {
-    use crate::store::{crc32, valid_name, RamDisk, Store, StoreErr, DATA_START, MAX_FILES};
+    use crate::store::{crc32, valid_component, valid_name, RamDisk, Store, StoreErr};
     check!(crc32(b"123456789") == 0xCBF4_3926, "crc32 check value");
-    check!(valid_name("a.b-c_d+e") && !valid_name("") && !valid_name("a/b") && !valid_name("..") && !valid_name(&"x".repeat(48)), "name validation");
+    check!(valid_name("a.b-c_d+e") && !valid_name("") && !valid_name("a/b") && !valid_name("..") && !valid_name(&"x".repeat(48)), "flat name validation");
+    check!(valid_component("hello world é.txt") && valid_component(&"x".repeat(255)) && !valid_component(&"x".repeat(256)) && !valid_component("a/b") && !valid_component("..") && !valid_component(""), "component validation");
 
     let mut st = Store::format(RamDisk::new(4096)).ok().expect("format ramdisk");
-    check!(st.list().is_empty() && st.stats().files == 0, "fresh store is empty");
+    check!(st.list().is_empty() && st.stats().files == 0 && st.stats().dirs == 0, "fresh store is empty");
     st.write("hello.txt", b"hello deloxy").unwrap();
     st.write("big.bin", &vec![0x5Au8; 100_000]).unwrap();
     st.write("empty", b"").unwrap();
@@ -1061,7 +1086,7 @@ fn test_store_logic() {
     check!(st.read("big.bin").unwrap().len() == 100_000 && st.read("big.bin").unwrap().iter().all(|&b| b == 0x5A), "read back 100 KB file");
     check!(st.read("empty").unwrap().is_empty(), "empty file");
     check!(st.read("nope") == Err(StoreErr::NotFound), "missing file -> NotFound");
-    check!(st.write("bad/name", b"x") == Err(StoreErr::BadName), "bad name rejected");
+    check!(st.write("bad\0name", b"x") == Err(StoreErr::BadName), "bad name rejected");
     check!(st.write("huge", &vec![0u8; crate::store::MAX_FILE_BYTES + 1]) == Err(StoreErr::TooLarge), "too large rejected");
     st.write("hello.txt", b"replaced").unwrap();
     check!(st.read("hello.txt").unwrap() == b"replaced" && st.list().len() == 3, "atomic replace keeps one entry");
@@ -1080,8 +1105,6 @@ fn test_store_logic() {
     check!(st.read("hello.txt").unwrap() == b"replaced", "data survives remount");
     st.delete("big.bin").unwrap();
     check!(st.read("big.bin") == Err(StoreErr::NotFound) && st.delete("big.bin") == Err(StoreErr::NotFound), "delete");
-
-    // space is reused after delete
     let before = st.stats().used_bytes;
     st.write("again", &vec![1u8; 100_000]).unwrap();
     check!(st.stats().used_bytes > before, "stats reflect new file");
@@ -1091,8 +1114,7 @@ fn test_store_logic() {
     loop {
         match st.write(&alloc::format!("fill{}", n), &vec![7u8; 64 * 1024]) {
             Ok(()) => n += 1,
-            Err(StoreErr::NoSpace) => break,
-            Err(StoreErr::TooManyFiles) => break,
+            Err(StoreErr::NoSpace) | Err(StoreErr::TooManyFiles) => break,
             Err(e) => {
                 check!(false, "unexpected error while filling: {:?}", e);
             }
@@ -1106,76 +1128,238 @@ fn test_store_logic() {
     st.write("after-fill", &vec![9u8; 64 * 1024]).unwrap();
     check!(st.read("again").unwrap().iter().all(|&b| b == 1), "earlier data untouched by fill/delete");
 
-    // file-count limit
-    let mut st = Store::format(RamDisk::new(4096)).ok().unwrap();
-    for i in 0..MAX_FILES {
-        st.write(&alloc::format!("f{}", i), b"x").unwrap();
-    }
-    check!(st.write("one-too-many", b"x") == Err(StoreErr::TooManyFiles), "file count limit");
-    check!(st.write("f0", b"y").is_ok(), "replacing at the limit is fine");
+    test_store_tree();
+    test_store_fragmentation();
+    test_store_migration();
+    test_store_crash();
+    test_store_corruption();
+    info!("selftest: store v2 ok (tree ops, symlinks, rename, fragmentation, v1 migration, torn writes in every operation, corruption fallback)");
+}
 
-    // ---- crash safety: tear the n-th device write of a replace and of a create, then remount
-    for create in [false, true] {
-        for k in 0..6usize {
+fn test_store_tree() {
+    use crate::store::{Kind, RamDisk, Store, StoreErr};
+    let mut st = Store::format(RamDisk::new(8192)).ok().unwrap();
+    check!(st.mkdir("a").is_ok() && st.mkdir("a/b").is_ok() && st.mkdir("a/b/c").is_ok(), "mkdir nested");
+    check!(st.mkdir("a") == Err(StoreErr::Exists), "mkdir existing -> Exists");
+    check!(st.mkdir("x/y") == Err(StoreErr::NotFound), "mkdir with missing parent -> NotFound");
+    st.write("a/b/c/deep.txt", b"deep").unwrap();
+    check!(st.read("/a/b/c/deep.txt").unwrap() == b"deep" && st.read("./a//b/../b/c/deep.txt").unwrap() == b"deep", "path normalisation (/, //, ., ..)");
+    check!(st.write("a/b/c/deep.txt/x", b"1") == Err(StoreErr::NotDir), "file used as a directory -> NotDir");
+    check!(st.write("a", b"x") == Err(StoreErr::IsDir) && st.read("a") == Err(StoreErr::IsDir), "directory used as a file -> IsDir");
+    check!(st.read("a/nope") == Err(StoreErr::NotFound) && st.write("nodir/f", b"1") == Err(StoreErr::NotFound), "missing paths -> NotFound");
+    let ls = st.readdir("a").unwrap();
+    check!(ls.len() == 1 && ls[0].name == "b" && ls[0].kind == Kind::Dir, "readdir");
+    check!(st.readdir("a/b/c/deep.txt") == Err(StoreErr::NotDir), "readdir of a file -> NotDir");
+    let s = st.stat("a/b/c/deep.txt", true).unwrap();
+    check!(s.kind == Kind::File && s.size == 4 && s.mode == 0o644, "stat file");
+    check!(st.rmdir("a") == Err(StoreErr::NotEmpty) && st.rmdir("a/b/c/deep.txt") == Err(StoreErr::NotDir), "rmdir refuses non-empty / non-directory");
+    check!(st.unlink("a/b") == Err(StoreErr::IsDir), "unlink refuses directories");
+    st.write("a/b/hello world é.txt", b"u").unwrap();
+    let long = "n".repeat(255);
+    check!(st.write(&alloc::format!("a/{}", long), b"1").is_ok() && st.write(&alloc::format!("a/{}", "n".repeat(256)), b"1") == Err(StoreErr::BadName), "255-byte names ok, 256 rejected");
+    // mode survives a rewrite
+    check!(st.chmod("a/b/c/deep.txt", 0o755).is_ok(), "chmod");
+    st.write("a/b/c/deep.txt", b"deeper").unwrap();
+    check!(st.stat("a/b/c/deep.txt", true).unwrap().mode == 0o755, "mode kept across replace");
+    // symlinks
+    check!(st.symlink("b/c", "a/lnk").is_ok(), "symlink (relative)");
+    check!(st.read("a/lnk/deep.txt").unwrap() == b"deeper", "read through a directory symlink");
+    check!(st.stat("a/lnk", false).unwrap().kind == Kind::Symlink && st.stat("a/lnk", true).unwrap().kind == Kind::Dir, "lstat vs stat");
+    check!(st.readlink("a/lnk").unwrap() == "b/c" && st.readlink("a/b") == Err(StoreErr::Invalid), "readlink");
+    check!(st.symlink("/a/b/c/deep.txt", "abs").is_ok() && st.read("abs").unwrap() == b"deeper", "absolute symlink");
+    check!(st.symlink("/store/a/b", "abs2").is_ok() && st.readdir("abs2").unwrap().len() == 2, "absolute symlink with /store prefix");
+    check!(st.write("a/lnk/deep.txt", b"via-link").is_ok() && st.read("a/b/c/deep.txt").unwrap() == b"via-link", "write through a symlink");
+    check!(st.symlink("l2", "l1").is_ok() && st.symlink("l1", "l2").is_ok() && st.read("l1") == Err(StoreErr::Loop), "symlink loop -> Loop");
+    check!(st.symlink("nowhere", "dang").is_ok() && st.read("dang") == Err(StoreErr::NotFound) && st.write("dang", b"x") == Err(StoreErr::NotFound), "dangling symlink");
+    check!(st.symlink("x", "dang") == Err(StoreErr::Exists), "symlink onto an existing name");
+    check!(st.unlink("dang").is_ok() && st.stat("dang", false) == Err(StoreErr::NotFound), "unlink removes the link, not the target");
+    check!(st.read("abs").is_ok(), "target survives unlink of a different link");
+    // rename
+    check!(st.rename("a/b/c/deep.txt", "moved.txt").is_ok() && st.read("moved.txt").unwrap() == b"via-link" && st.read("a/b/c/deep.txt") == Err(StoreErr::NotFound), "rename across directories");
+    st.write("victim", b"old").unwrap();
+    check!(st.rename("moved.txt", "victim").is_ok() && st.read("victim").unwrap() == b"via-link", "rename replaces a file");
+    check!(st.rename("a", "victim") == Err(StoreErr::NotDir), "directory over a file -> NotDir");
+    check!(st.rename("victim", "a") == Err(StoreErr::IsDir), "file over a directory -> IsDir");
+    check!(st.rename("a", "a/b/zz") == Err(StoreErr::Invalid), "directory into itself -> Invalid");
+    check!(st.mkdir("e1").is_ok() && st.mkdir("e2").is_ok() && st.rename("e1", "e2").is_ok() && st.stat("e1", true) == Err(StoreErr::NotFound), "directory replaces an empty directory");
+    check!(st.mkdir("full").is_ok() && st.write("full/f", b"1").is_ok() && st.rename("e2", "full") == Err(StoreErr::NotEmpty), "directory over a non-empty directory -> NotEmpty");
+    check!(st.rename("a", "renamed").is_ok() && st.read("renamed/b/hello world é.txt").unwrap() == b"u", "rename a whole subtree");
+    check!(st.rename("nope", "x") == Err(StoreErr::NotFound), "rename of a missing source");
+    check!(st.rename("victim", "victim").is_ok(), "rename onto itself is a no-op");
+    // everything survives a remount and the tree validates
+    let before = store_snapshot(&mut st);
+    let mut st = Store::mount(st.into_dev()).ok().expect("remount tree");
+    check!(store_snapshot(&mut st) == before, "tree identical after remount ({} entries)", before.len());
+    // many entries in one directory
+    st.mkdir("many").unwrap();
+    for i in 0..300 {
+        st.write(&alloc::format!("many/file-{:04}", i), alloc::format!("content {}", i).as_bytes()).unwrap();
+    }
+    check!(st.readdir("many").unwrap().len() == 300, "300 files in one directory");
+    let mut st = Store::mount(st.into_dev()).ok().expect("remount many");
+    check!(st.read("many/file-0299").unwrap() == b"content 299", "read after remount (many files)");
+    for i in 0..300 {
+        st.unlink(&alloc::format!("many/file-{:04}", i)).unwrap();
+    }
+    check!(st.rmdir("many").is_ok(), "directory removable once empty");
+}
+
+fn test_store_fragmentation() {
+    use crate::store::{RamDisk, Store, StoreErr};
+    let mut st = Store::format(RamDisk::new(1200)).ok().unwrap();
+    // 20 files of 12 KiB fill most of the disk; deleting every other one leaves only 12 KiB holes
+    let mut n = 0;
+    while st.write(&alloc::format!("f{}", n), &vec![n as u8; 12 * 1024]).is_ok() {
+        n += 1;
+        if n > 60 {
+            break;
+        }
+    }
+    check!(n >= 20 && n <= 60, "filled {} slots", n);
+    for i in (0..n).step_by(2) {
+        st.delete(&alloc::format!("f{}", i)).unwrap();
+    }
+    let big: Vec<u8> = (0..60_000u32).map(|i| (i * 7 + 1) as u8).collect();
+    let r = st.write("big-fragmented", &big);
+    check!(r.is_ok(), "a file bigger than any hole is stored as several extents: {:?}", r);
+    check!(st.read("big-fragmented").unwrap() == big, "multi-extent file reads back");
+    let mut st = Store::mount(st.into_dev()).ok().unwrap();
+    check!(st.read("big-fragmented").unwrap() == big && st.read("f1").unwrap().iter().all(|&b| b == 1), "multi-extent file and neighbours survive remount");
+    check!(st.write("way-too-big", &vec![0u8; 2_000_000]) == Err(StoreErr::NoSpace), "does not fit -> NoSpace");
+    check!(st.read("big-fragmented").unwrap() == big, "failed write leaves the disk intact");
+}
+
+fn test_store_migration() {
+    use crate::store::{format_v1_for_test, RamDisk, Store};
+    let mut dev = RamDisk::new(2048);
+    let a: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    format_v1_for_test(&mut dev, &[("alpha.bin", &a), ("beta.txt", b"beta"), ("empty", b"")]);
+    let mut st = Store::mount(dev).ok().expect("mount a v1 store");
+    check!(st.list().len() == 3 && st.read("alpha.bin").unwrap() == a && st.read("beta.txt").unwrap() == b"beta", "v1 store mounts unchanged");
+    let gen1 = st.stats().generation;
+    check!(st.mkdir("docs").is_ok() && st.write("docs/new.txt", b"after migration").is_ok(), "first write converts to v2");
+    check!(st.stats().generation > gen1, "generation advances");
+    let mut st = Store::mount(st.into_dev()).ok().expect("remount migrated store");
+    check!(st.read("alpha.bin").unwrap() == a && st.read("docs/new.txt").unwrap() == b"after migration" && st.read("beta.txt").unwrap() == b"beta", "old files and new files after migration");
+    // crash during the migrating write: either the pure v1 view or the converted view, never a mix
+    for k in 0..6usize {
+        let mut dev = RamDisk::new(2048);
+        format_v1_for_test(&mut dev, &[("alpha.bin", &a), ("beta.txt", b"beta")]);
+        dev.revive();
+        dev.fail_at_write = Some(k);
+        let mut st = Store::mount(dev).ok().unwrap();
+        let r = st.write("gamma", b"gamma-data");
+        let mut dev = st.into_dev();
+        dev.revive();
+        let mut st = Store::mount(dev).ok().expect("remount after torn migration");
+        check!(st.read("alpha.bin").unwrap() == a && st.read("beta.txt").unwrap() == b"beta", "k={}: old files intact after torn migration", k);
+        let g = st.read("gamma");
+        check!(r.is_ok() == g.is_ok(), "k={}: write result {:?} disagrees with disk {:?}", k, r, g.is_ok());
+    }
+}
+
+fn test_store_crash() {
+    use crate::store::{RamDisk, Store, StoreErr};
+    type Setup = fn(&mut Store<RamDisk>);
+    type Op = fn(&mut Store<RamDisk>) -> Result<(), StoreErr>;
+    fn base(st: &mut Store<RamDisk>) {
+        st.write("keep", b"stable").unwrap();
+        st.mkdir("d").unwrap();
+        st.write("d/a", b"version-one").unwrap();
+        st.mkdir("e").unwrap();
+        st.symlink("d/a", "ln").unwrap();
+    }
+    let ops: [(&str, Op); 9] = [
+        ("replace", |s| s.write("d/a", &vec![0xEEu8; 3000])),
+        ("create", |s| s.write("d/new", &vec![0xEEu8; 3000])),
+        ("mkdir", |s| s.mkdir("d/sub")),
+        ("rename file", |s| s.rename("d/a", "moved")),
+        ("rename dir", |s| s.rename("d", "d2")),
+        ("unlink", |s| s.unlink("d/a")),
+        ("rmdir", |s| s.rmdir("e")),
+        ("symlink", |s| s.symlink("keep", "l2")),
+        ("rename over", |s| s.rename("keep", "d/a")),
+    ];
+    let setup: Setup = base;
+    for (name, op) in ops.iter() {
+        let fresh = || {
             let mut st = Store::format(RamDisk::new(2048)).ok().unwrap();
-            st.write("keep", b"stable").unwrap();
-            st.write("a", b"version-one").unwrap();
+            setup(&mut st);
+            st
+        };
+        let mut st = fresh();
+        let snap0 = store_snapshot(&mut st);
+        check!(op(&mut st).is_ok(), "{}: clean run", name);
+        let snap1 = store_snapshot(&mut st);
+        check!(snap0 != snap1, "{}: operation changes the tree", name);
+        for k in 0..6usize {
+            let mut st = fresh();
             {
                 let d = st.dev_mut();
                 d.revive();
                 d.fail_at_write = Some(k);
             }
-            let name = if create { "new" } else { "a" };
-            let r = st.write(name, &vec![0xEEu8; 3000]);
+            let r = op(&mut st);
             let mut dev = st.into_dev();
             dev.revive();
             let mut st = match Store::mount(dev) {
                 Ok(s) => s,
                 Err((e, _)) => {
-                    check!(false, "crash k={} create={}: remount failed {:?}", k, create, e);
+                    check!(false, "{} k={}: remount failed {:?}", name, k, e);
                     unreachable!()
                 }
             };
-            check!(st.read("keep").unwrap() == b"stable", "crash k={}: unrelated file damaged", k);
-            let a = st.read("a");
-            if create {
-                let new = st.read("new");
-                check!(a.as_deref() == Ok(&b"version-one"[..]), "crash k={} (create): existing file lost", k);
-                check!(new == Err(StoreErr::NotFound) || new.as_deref().map_or(false, |d| d.len() == 3000 && d.iter().all(|&b| b == 0xEE)), "crash k={} (create): torn new file visible", k);
-                check!(r.is_ok() == new.is_ok(), "crash k={} (create): result {:?} disagrees with disk", k, r);
-            } else {
-                let ok_old = a.as_deref() == Ok(&b"version-one"[..]);
-                let ok_new = a.as_deref().map_or(false, |d| d.len() == 3000 && d.iter().all(|&b| b == 0xEE));
-                check!(ok_old || ok_new, "crash k={} (replace): file is neither old nor new ({:?})", k, a.as_ref().map(|d| d.len()));
-                check!(r.is_ok() == ok_new, "crash k={} (replace): write result {:?} but disk has {}", k, r, if ok_new { "new" } else { "old" });
-            }
+            let snap = store_snapshot(&mut st);
+            check!(snap == snap0 || snap == snap1, "{} k={}: tree is neither the old nor the new state", name, k);
+            check!(r.is_ok() == (snap == snap1), "{} k={}: result {:?} disagrees with disk", name, k, r);
         }
     }
+}
 
-    // ---- corruption detection
+fn test_store_corruption() {
+    use crate::store::{RamDisk, Store, StoreErr, DATA_START};
     let mut st = Store::format(RamDisk::new(2048)).ok().unwrap();
     st.write("x", &vec![3u8; 2000]).unwrap(); // gen 2 -> slot B
     st.write("y", b"second").unwrap(); // gen 3 -> slot A
-    let slot_a_cur = true;
     let mut dev = st.into_dev();
-    // flip a data byte of x
-    dev.data[(DATA_START as usize) * 512 + 7] ^= 0xFF;
+    // find x's data extent and flip a byte of it
+    let x_start = {
+        let mut copy = RamDisk::new(2048);
+        copy.data.copy_from_slice(&dev.data);
+        let st = Store::mount(copy).ok().unwrap();
+        st.list().iter().find(|e| e.name == "x").unwrap().start
+    };
+    check!(x_start >= DATA_START, "x has an extent");
+    dev.data[x_start as usize * 512 + 7] ^= 0xFF;
     let mut st = Store::mount(dev).ok().unwrap();
     check!(st.read("x") == Err(StoreErr::Corrupt), "flipped data byte detected by CRC");
-    // destroy the newest directory: mount must fall back to the previous generation (without "y")
+    // destroy the newest root record: mount must fall back to the previous generation (without "y")
     let mut dev = st.into_dev();
-    let cur_slot_sector = if slot_a_cur { 1 } else { 1 + crate::store::DIR_SECTORS as usize };
-    dev.data[cur_slot_sector * 512 + 40] ^= 0xFF;
+    dev.data[512 + 40] ^= 0xFF; // slot A (gen 3)
     let st = Store::mount(dev).ok().expect("fallback mount");
-    check!(st.list().iter().any(|e| e.name == "x") && !st.list().iter().any(|e| e.name == "y"), "damaged newest directory falls back to the previous generation");
-    // both directories destroyed -> refuse to mount (never guess)
+    check!(st.list().iter().any(|e| e.name == "x") && !st.list().iter().any(|e| e.name == "y"), "damaged newest root record falls back to the previous generation");
+    // a bit flip inside the newest metadata image is caught by its CRC the same way
+    let mut st = Store::format(RamDisk::new(2048)).ok().unwrap();
+    st.write("p", b"one").unwrap();
+    st.write("q", b"two").unwrap();
+    let mut dev = st.into_dev();
+    let mut rec = vec![0u8; 512];
+    for slot in [1u64, 1 + crate::store::DIR_SECTORS] {
+        rec.copy_from_slice(&dev.data[slot as usize * 512..slot as usize * 512 + 512]);
+        let gen = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+        if gen == 3 {
+            let mstart = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+            dev.data[mstart as usize * 512 + 20] ^= 0x01;
+        }
+    }
+    let st = Store::mount(dev).ok().expect("fallback after metadata corruption");
+    check!(st.list().iter().any(|e| e.name == "p") && !st.list().iter().any(|e| e.name == "q"), "corrupt metadata image falls back to the previous generation");
+    // both root records destroyed -> refuse to mount (never guess)
     let mut dev = st.into_dev();
     dev.data[(1 + crate::store::DIR_SECTORS as usize) * 512 + 40] ^= 0xFF;
     dev.data[512 + 41] ^= 0xFF;
-    check!(matches!(Store::mount(dev), Err((StoreErr::Corrupt, _))), "both directories bad -> Corrupt");
-    // blank disk -> NoFilesystem, never auto-formatted
+    check!(matches!(Store::mount(dev), Err((StoreErr::Corrupt, _))), "both root records bad -> Corrupt");
     check!(matches!(Store::mount(RamDisk::new(2048)), Err((StoreErr::NoFilesystem, _))), "blank disk -> NoFilesystem");
-    info!("selftest: store logic ok (format/mount, atomic replace, ENOSPC, 12 power-cut points, CRC + fallback)");
 }
 
 fn test_store_device() {

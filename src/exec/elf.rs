@@ -240,6 +240,10 @@ pub fn plan(d: &[u8]) -> Result<Plan, ExecError> {
         interp,
         main_entry: 0,
         at_base: 0,
+        extra_segments: Vec::new(),
+        dll_bytes: None,
+        modules: Vec::new(),
+        dll_init: Vec::new(),
     })
 }
 

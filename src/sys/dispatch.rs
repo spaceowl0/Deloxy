@@ -106,7 +106,7 @@ pub extern "C" fn syscall_dispatch(f: &mut SyscallFrame) {
         SYS_PORT_OUT => sys_port_out(a0, a1, a2 as u32),
         SYS_AUDIT_READ => sys_audit_read(a0, a1, a2 as usize),
         SYS_STAT => sys_stat(a0),
-        21..=37 => super::sysx::handle(nr, f),
+        21..=38 => super::sysx::handle(nr, f),
         _ => -ENOSYS,
     };
     if nr != SYS_EXIT {

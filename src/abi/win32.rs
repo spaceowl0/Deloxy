@@ -31,8 +31,14 @@ fn stack(p: &Arc<Process>, k: usize) -> u64 {
     let _ = crate::sys::uaccess::copy_from_user(p, &mut b, rsp + super::msvcrt::STACK_ARG0 + 8 * (k as u64 - 4));
     u64::from_le_bytes(b)
 }
+/// A Win32 path from user memory: backslashes become '/', a leading drive letter ("C:") is dropped.
 fn path_arg(p: &Arc<Process>, va: u64) -> String {
-    String::from_utf8_lossy(&read_cstr(p, va, 260)).replace('\\', "/")
+    let s = String::from_utf8_lossy(&read_cstr(p, va, 260)).replace('\\', "/");
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return String::from(&s[2..]);
+    }
+    s
 }
 fn err_for(e: i64) -> u32 {
     match e {
@@ -230,7 +236,7 @@ pub fn delete_file(p: &Arc<Process>, a: A) -> u64 {
 
 pub fn get_file_attributes(p: &Arc<Process>, a: A) -> u64 {
     let path = path_arg(p, a[0]);
-    if vfs::is_dir_path(path.trim_end_matches('/')) || path == "C:" || path == "C:/" {
+    if vfs::is_dir_path(path.trim_end_matches('/')) || path == "C:" || path == "C:/" || vfs::is_dir_abs(p, &vfs::resolve_abs(p, &path)) {
         return 0x10;
     }
     if vfs::open(p, &path, false, false, false, false).is_ok() {
@@ -255,9 +261,15 @@ fn glob(pat: &[u8], s: &[u8]) -> bool {
     }
 }
 
-fn fill_find(p: &Arc<Process>, out: u64, name: &str) {
-    let size = vfs::open(p, name, false, false, false, false).map(|f| f.len() as u64).unwrap_or(0);
-    let is_dir = name == "." || name == "..";
+/// `entry` is a directory listing name ("name" or "name/" for directories); `dirpath` the listed directory.
+fn fill_find(p: &Arc<Process>, out: u64, entry: &str, dirpath: &str) {
+    let is_dir = entry.ends_with('/');
+    let name = entry.trim_end_matches('/');
+    let size = if is_dir {
+        0
+    } else {
+        vfs::open(p, &alloc::format!("{}/{}", dirpath.trim_end_matches('/'), name), false, false, false, false).map(|f| f.len() as u64).unwrap_or(0)
+    };
     let mut d = alloc::vec![0u8; 320];
     d[0..4].copy_from_slice(&(if is_dir { 0x10u32 } else { 0x80 }).to_le_bytes());
     d[28..32].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
@@ -268,16 +280,20 @@ fn fill_find(p: &Arc<Process>, out: u64, name: &str) {
 }
 
 /// Advance the directory search in slot `i` to the next entry matching its pattern.
-fn find_step(p: &Arc<Process>, i: usize) -> Option<String> {
+fn find_step(p: &Arc<Process>, i: usize) -> Option<(String, String)> {
     let mut g = p.foreign.lock();
     let f = g.fds.get_mut(i)?.as_mut()?;
     let vfs::Data::Dir(names) = &f.data else { return None };
-    let pat = f.name.clone();
+    // f.name = "<directory path>\0<pattern>"
+    let (dirpath, pat) = match f.name.split_once('\0') {
+        Some((d, pt)) => (String::from(d), String::from(pt)),
+        None => (String::from("/"), f.name.clone()),
+    };
     while f.pos < names.len() {
         let n = names[f.pos].clone();
         f.pos += 1;
-        if glob(pat.as_bytes(), n.as_bytes()) {
-            return Some(n);
+        if glob(pat.as_bytes(), n.trim_end_matches('/').as_bytes()) {
+            return Some((n, dirpath));
         }
     }
     None
@@ -285,16 +301,29 @@ fn find_step(p: &Arc<Process>, i: usize) -> Option<String> {
 
 pub fn find_first_file(p: &Arc<Process>, a: A) -> u64 {
     let pat = path_arg(p, a[0]);
-    let last = pat.rsplit('/').next().unwrap_or("*");
-    let mut dir = vfs::open_dir(p);
-    dir.name = String::from(if last.is_empty() { "*" } else { last });
+    let (dirpart, last) = match pat.rfind('/') {
+        Some(i) => (&pat[..i], &pat[i + 1..]),
+        None => ("", pat.as_str()),
+    };
+    let mut dir = if dirpart.is_empty() {
+        vfs::open_dir(p)
+    } else {
+        match vfs::open(p, dirpart, false, false, false, false) {
+            Ok(f) if f.is_dir() => f,
+            _ => {
+                set_err(p, 3); // ERROR_PATH_NOT_FOUND
+                return INVALID;
+            }
+        }
+    };
+    dir.name = alloc::format!("{}\0{}", dir.name, if last.is_empty() { "*" } else { last });
     let Ok(i) = vfs::alloc(p, dir) else {
         set_err(p, 4);
         return INVALID;
     };
     match find_step(p, i) {
-        Some(n) => {
-            fill_find(p, a[1], &n);
+        Some((n, d)) => {
+            fill_find(p, a[1], &n, &d);
             handle(i)
         }
         None => {
@@ -311,8 +340,8 @@ pub fn find_next_file(p: &Arc<Process>, a: A) -> u64 {
         return 0;
     };
     match find_step(p, i) {
-        Some(n) => {
-            fill_find(p, a[1], &n);
+        Some((n, d)) => {
+            fill_find(p, a[1], &n, &d);
             1
         }
         None => {
@@ -327,7 +356,11 @@ pub fn find_close(p: &Arc<Process>, a: A) -> u64 {
 }
 
 pub fn get_module_file_name(p: &Arc<Process>, a: A) -> u64 {
-    let s = b"C:\\deloxy\\app.exe\0";
+    let mut s: alloc::vec::Vec<u8> = match crate::exec::dll::module_name(p, a[0]) {
+        Some(n) => alloc::format!("C:\\deloxy\\{}", n).into_bytes(),
+        None => b"C:\\deloxy\\app.exe".to_vec(),
+    };
+    s.push(0);
     let n = s.len().min(a[2] as usize);
     let _ = copy_to_user(p, a[1], &s[..n]);
     (s.len() - 1).min(n) as u64
@@ -375,7 +408,40 @@ pub fn get_local_time(p: &Arc<Process>, a: A) -> u64 {
     0
 }
 
-pub fn create_directory(p: &Arc<Process>, _: A) -> u64 {
-    set_err(p, ERR_ACCESS_DENIED);
-    0
+pub fn create_directory(p: &Arc<Process>, a: A) -> u64 {
+    match vfs::mkdir(p, &path_arg(p, a[0])) {
+        Ok(()) => 1,
+        Err(17) => {
+            set_err(p, 183); // ERROR_ALREADY_EXISTS
+            0
+        }
+        Err(e) => {
+            set_err(p, if e == vfs::ENOENT { 3 } else { ERR_ACCESS_DENIED }); // ERROR_PATH_NOT_FOUND
+            0
+        }
+    }
+}
+
+pub fn remove_directory(p: &Arc<Process>, a: A) -> u64 {
+    match vfs::rmdir(p, &path_arg(p, a[0])) {
+        Ok(()) => 1,
+        Err(e) => {
+            set_err(p, match e {
+                vfs::ENOENT => 3,
+                39 => 145, // ERROR_DIR_NOT_EMPTY
+                _ => ERR_ACCESS_DENIED,
+            });
+            0
+        }
+    }
+}
+
+pub fn move_file(p: &Arc<Process>, a: A) -> u64 {
+    match vfs::rename(p, &path_arg(p, a[0]), &path_arg(p, a[1])) {
+        Ok(()) => 1,
+        Err(e) => {
+            set_err(p, err_for(e));
+            0
+        }
+    }
 }

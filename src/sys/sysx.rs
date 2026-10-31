@@ -8,6 +8,7 @@
 //! 31 upd(net, req_ptr)                   32 power(h, op)
 //! 33 store_list(h, index, buf, max)      34 store_open(h, name, len)    35 store_write(h, name, len, data, dlen)
 //! 36 store_ctl(h, op, name, len, out)    (op 0 delete, 1 stats, 2 format)
+//! 38 store_fs(h, op, path, plen, a4, a5) hierarchical store: stat/readdir/mkdir/rmdir/unlink/rename/symlink/readlink/chmod/read/write
 
 use alloc::format;
 use alloc::string::String;
@@ -37,6 +38,7 @@ pub const SYS_STORE_OPEN: u64 = 34;
 pub const SYS_STORE_WRITE: u64 = 35;
 pub const SYS_STORE_CTL: u64 = 36;
 pub const SYS_PERM: u64 = 37;
+pub const SYS_STORE_FS: u64 = 38;
 
 pub const ENOEXEC: i64 = 8;
 const MAX_ARGS_BYTES: usize = 512;
@@ -63,6 +65,7 @@ pub fn handle(nr: u64, f: &SyscallFrame) -> i64 {
         SYS_STORE_WRITE => store_write(a0, a1, a2 as usize, a3, a4 as usize),
         SYS_STORE_CTL => store_ctl(a0, a1, a2, a3 as usize, a4),
         SYS_PERM => perm_ctl(a0, a1, a2, a3 as usize, a4),
+        SYS_STORE_FS => store_fs(a0, a1, a2, a3 as usize, a4, a5),
         _ => -ENOSYS,
     }
 }
@@ -429,15 +432,7 @@ fn power(h: u64, op: u64) -> i64 {
 // ---------------------------------------------------------------- persistent store ---
 
 fn store_err(e: crate::store::StoreErr) -> i64 {
-    use crate::store::StoreErr::*;
-    match e {
-        NoFilesystem => ENODEV,
-        NotFound => ENOENT,
-        BadName => EINVAL,
-        TooLarge => EFBIG,
-        NoSpace | TooManyFiles => ENOSPC,
-        Corrupt | Io(_) => EIO,
-    }
+    e.errno()
 }
 
 /// `upd.*` belongs to the kernel updater: user programs may read it but never create, replace or delete it.
@@ -527,7 +522,160 @@ fn store_write(h: u64, name: u64, len: usize, data: u64, dlen: usize) -> i64 {
     }
 }
 
-/// op 0: delete `name` (WRITE) | op 1: stats -> five u64 at `out`: total, data, used bytes, files, generation (READ)
+/// A store path from user memory: UTF-8, leading '/' and an optional "store/" prefix tolerated.
+fn store_path(p: &task::Process, ptr: u64, len: usize) -> Result<String, i64> {
+    let raw = user_bytes(p, ptr, len, crate::store::PATH_MAX)?;
+    let s = core::str::from_utf8(&raw).map_err(|_| EINVAL)?;
+    if s.bytes().any(|b| b == 0) {
+        return Err(EINVAL);
+    }
+    let s = s.trim_start_matches('/');
+    let s = if s == "store" { "" } else { s.strip_prefix("store/").unwrap_or(s) };
+    Ok(String::from(s))
+}
+
+fn guarded(path: &str, destructive: bool) -> bool {
+    let c = path.split('/').find(|c| !c.is_empty() && *c != ".").unwrap_or("");
+    crate::store::is_reserved(c) || (destructive && c == "de.conf")
+}
+
+/// Hierarchical store access. ops (need READ unless marked W = WRITE):
+/// 0 stat(path) -> 32-byte record at a4 {kind u8 @0 (1 file, 2 dir, 3 symlink), mode u16 @2, size u64 @8, mtime u64 @16, ino u32 @24}
+/// 1 readdir(path, a5 = index) -> 320-byte record at a4 {kind u8 @0, size u64 @8, name from @16}; returns name length, -ENOENT past the end
+/// 2 mkdir W | 3 rmdir W | 4 unlink W | 5 rename W (a4/a5 = destination ptr/len) | 6 symlink W (a4/a5 = target ptr/len)
+/// 7 readlink(path) -> bytes at a4 (capacity a5), returns length | 8 chmod W (a4 = mode)
+/// 9 read(path) -> bytes at a4 (capacity a5), returns the file size (larger than a5 means "truncated, retry bigger")
+/// 10 write W (a4/a5 = data ptr/len): create or atomically replace.
+fn store_fs(h: u64, op: u64, path: u64, plen: usize, a4: u64, a5: u64) -> i64 {
+    let need = if matches!(op, 0 | 1 | 7 | 9) { Rights::READ } else { Rights::WRITE };
+    if let Err(e) = need_store(h, need) {
+        return -e;
+    }
+    let p = task::current_process();
+    let path = match store_path(&p, path, plen) {
+        Ok(s) => s,
+        Err(e) => return -e,
+    };
+    if need == Rights::WRITE && guarded(&path, op != 10 && op != 8) {
+        return -EPERM;
+    }
+    macro_rules! st {
+        ($e:expr) => {
+            match crate::store::with($e) {
+                Err(e) | Ok(Err(e)) => return -store_err(e),
+                Ok(Ok(v)) => v,
+            }
+        };
+    }
+    let out = |buf: u64, data: &[u8]| -> i64 {
+        match uaccess::copy_to_user(&p, buf, data) {
+            Ok(()) => 0,
+            Err(e) => -e,
+        }
+    };
+    let kind_code = |k: crate::store::Kind| -> u8 {
+        match k {
+            crate::store::Kind::File => 1,
+            crate::store::Kind::Dir => 2,
+            crate::store::Kind::Symlink => 3,
+        }
+    };
+    let r = match op {
+        0 => {
+            let s = st!(|s| s.stat(&path, false));
+            let mut rec = [0u8; 32];
+            rec[0] = kind_code(s.kind);
+            rec[2..4].copy_from_slice(&s.mode.to_le_bytes());
+            rec[8..16].copy_from_slice(&s.size.to_le_bytes());
+            rec[16..24].copy_from_slice(&s.mtime.to_le_bytes());
+            rec[24..28].copy_from_slice(&s.ino.to_le_bytes());
+            out(a4, &rec)
+        }
+        1 => {
+            let ents = st!(|s| s.readdir(&path));
+            let Some(e) = ents.get(a5 as usize) else { return -ENOENT };
+            let mut rec = [0u8; 320];
+            rec[0] = kind_code(e.kind);
+            rec[8..16].copy_from_slice(&e.size.to_le_bytes());
+            let n = e.name.len().min(300);
+            rec[16..16 + n].copy_from_slice(&e.name.as_bytes()[..n]);
+            let r = out(a4, &rec);
+            if r < 0 {
+                return r;
+            }
+            return n as i64;
+        }
+        2 => {
+            st!(|s| s.mkdir(&path));
+            0
+        }
+        3 => {
+            st!(|s| s.rmdir(&path));
+            0
+        }
+        4 => {
+            st!(|s| s.unlink(&path));
+            0
+        }
+        5 => {
+            let to = match store_path(&p, a4, a5 as usize) {
+                Ok(s) => s,
+                Err(e) => return -e,
+            };
+            if guarded(&to, true) {
+                return -EPERM;
+            }
+            st!(|s| s.rename(&path, &to));
+            0
+        }
+        6 => {
+            let raw = match user_bytes(&p, a4, a5 as usize, crate::store::SYMLINK_MAX) {
+                Ok(v) => v,
+                Err(e) => return -e,
+            };
+            let Ok(t) = core::str::from_utf8(&raw) else { return -EINVAL };
+            st!(|s| s.symlink(t, &path));
+            0
+        }
+        7 => {
+            let t = st!(|s| s.readlink(&path));
+            let n = t.len().min(a5 as usize);
+            let r = out(a4, &t.as_bytes()[..n]);
+            if r < 0 {
+                return r;
+            }
+            return n as i64;
+        }
+        8 => {
+            st!(|s| s.chmod(&path, a4 as u16));
+            0
+        }
+        9 => {
+            let d = st!(|s| s.read(&path));
+            let n = d.len().min(a5 as usize);
+            let r = out(a4, &d[..n]);
+            if r < 0 {
+                return r;
+            }
+            return d.len() as i64;
+        }
+        10 => {
+            let bytes = match user_bytes(&p, a4, a5 as usize, crate::store::MAX_FILE_BYTES) {
+                Ok(v) => v,
+                Err(_) => return -EFBIG,
+            };
+            st!(|s| s.write(&path, &bytes));
+            0
+        }
+        _ => -EINVAL,
+    };
+    if need == Rights::WRITE {
+        crate::audit_log!(crate::audit::EV_SYSCALL, SYS_STORE_FS, h, op, 0, r);
+    }
+    r
+}
+
+/// op 0: delete `name` (WRITE) | op 1: stats -> six u64 at `out`: total, data, used bytes, files, generation, directories (READ)
 /// | op 2: format the disk, destroying all data (GRANT).
 fn store_ctl(h: u64, op: u64, name: u64, len: usize, out: u64) -> i64 {
     let p = task::current_process();
@@ -556,8 +704,8 @@ fn store_ctl(h: u64, op: u64, name: u64, len: usize, out: u64) -> i64 {
                 Ok(s) => s,
                 Err(e) => return -store_err(e),
             };
-            let mut rec = [0u8; 40];
-            for (i, v) in [st.total_bytes, st.data_bytes, st.used_bytes, st.files as u64, st.generation].iter().enumerate() {
+            let mut rec = [0u8; 48];
+            for (i, v) in [st.total_bytes, st.data_bytes, st.used_bytes, st.files as u64, st.generation, st.dirs as u64].iter().enumerate() {
                 rec[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
             }
             match uaccess::copy_to_user(&p, out, &rec) {

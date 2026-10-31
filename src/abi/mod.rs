@@ -14,6 +14,7 @@ pub mod win32;
 pub mod winmath;
 pub mod winsock;
 pub mod win_extra;
+pub mod win_exc;
 pub mod win32_thr;
 pub mod nt;
 pub mod sock;
@@ -62,6 +63,28 @@ pub enum KObj {
 
 pub struct ForeignState {
     pub image_base: u64,
+    /// PE: DLLs loaded in this process (static imports and LoadLibrary)
+    pub modules: alloc::vec::Vec<crate::exec::pe::Module>,
+    /// PE: next free address for relocated DLLs
+    pub dll_next: u64,
+    /// PE: a LoadLibrary/FreeLibrary left DllMain calls queued (the syscall returns through the continuation stub)
+    pub pending_init: bool,
+    /// process group / session ids (0 = the process's own pid: a program started by the shell leads its own group and session)
+    pub pgid: u64,
+    pub sid: u64,
+    /// job control: stopped by SIGSTOP/SIGTSTP/..., which signal stopped it, whether wait4 reported it, whether a SIGCONT is unreported
+    pub stopped: bool,
+    pub stop_sig: u8,
+    pub stop_reported: bool,
+    pub continued: bool,
+    /// a line typed so far when a signal interrupted a console read (resumed by the restarted read)
+    pub stdin_partial: alloc::vec::Vec<u8>,
+    /// PE: vectored exception handlers (handle, function) in call order, the next handle number, the unhandled-exception filter
+    pub veh: alloc::vec::Vec<(u64, u64)>,
+    pub veh_next: u64,
+    pub ueh: u64,
+    /// PE: end of the executable image (DLL placement avoids it)
+    pub brk_base_hint: u64,
     pub brk_base: u64,
     pub brk: u64,
     pub brk_mapped: u64,
@@ -138,6 +161,9 @@ impl ForeignState {
     pub fn fork_clone(&self) -> ForeignState {
         let mut n = ForeignState::new();
         n.image_base = self.image_base;
+        n.modules = self.modules.clone();
+        n.dll_next = self.dll_next;
+        n.brk_base_hint = self.brk_base_hint;
         n.brk_base = self.brk_base;
         n.brk = self.brk;
         n.brk_mapped = self.brk_mapped;
@@ -165,7 +191,8 @@ impl ForeignState {
         n.argc = self.argc;
         n.argv_va = self.argv_va;
         n.sig.actions = self.sig.actions; // handlers, masks and the signal mask are inherited; pending signals and timers are not
-        n.sig.mask = self.sig.mask;
+        n.sig.mask = signals::tmask(self.sig.mask);
+        n.sig.altstack = self.sig.altstack;
         n.cwd = self.cwd.clone();
         n.nthreads = 1;
         n.fds = self.fds.iter().map(|f| f.as_ref().and_then(vfs::clone_open)).collect();
@@ -177,6 +204,12 @@ impl ForeignState {
     /// survive. Network decisions and grants do **not**: the new program must earn its own.
     pub fn reset_for_exec(&mut self) {
         self.image_base = 0;
+        self.modules.clear();
+        self.dll_next = 0;
+        self.pending_init = false;
+        self.veh.clear();
+        self.ueh = 0;
+        self.brk_base_hint = 0;
         self.brk_base = 0;
         self.brk = 0;
         self.brk_mapped = 0;
@@ -209,11 +242,26 @@ impl ForeignState {
             }
         }
         self.sig.saved_mask = None;
+        self.sig.altstack = (0, 0, true);
     }
 
     pub const fn new() -> ForeignState {
         ForeignState {
             image_base: 0,
+            modules: alloc::vec::Vec::new(),
+            dll_next: 0,
+            pending_init: false,
+            pgid: 0,
+            sid: 0,
+            stopped: false,
+            stop_sig: 0,
+            stop_reported: false,
+            continued: false,
+            stdin_partial: alloc::vec::Vec::new(),
+            veh: alloc::vec::Vec::new(),
+            veh_next: 0,
+            ueh: 0,
+            brk_base_hint: 0,
             brk_base: 0,
             brk: 0,
             brk_mapped: 0,
@@ -287,6 +335,9 @@ impl ForeignState {
 /// Cooked terminal input for foreign programs: echoes, edits (backspace) and returns one line at a time
 /// (up to `max` bytes; the rest stays buffered). Ctrl-D on an empty line is end-of-file (empty result).
 /// Requires the process's console capability (the same terminal it writes to).
+/// `stdin_read` result: a signal interrupted the wait (Linux `read` maps it to ERESTART).
+pub const STDIN_INTR: i64 = -0x5151;
+
 pub fn stdin_read(p: &Arc<Process>, max: usize) -> Result<alloc::vec::Vec<u8>, i64> {
     if p.foreign.lock().console == 0 {
         return Err(EBADF);
@@ -298,10 +349,14 @@ pub fn stdin_read(p: &Arc<Process>, max: usize) -> Result<alloc::vec::Vec<u8>, i
             return Ok(f.stdin_buf.drain(..n).collect());
         }
     }
-    let mut line: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut line: alloc::vec::Vec<u8> = core::mem::take(&mut p.foreign.lock().stdin_partial);
     let mut b = [0u8; 1];
     loop {
         if crate::tty::read_input(&mut b) == 0 {
+            if signals::interrupted(p) {
+                p.foreign.lock().stdin_partial = line;
+                return Err(STDIN_INTR);
+            }
             crate::task::sleep_ms(2);
             continue;
         }
