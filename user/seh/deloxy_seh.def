@@ -1,0 +1,7 @@
+LIBRARY deloxy_seh.dll
+EXPORTS
+RtlLookupFunctionEntry = rt_lookup
+RtlVirtualUnwind = rt_virtual_unwind
+RtlUnwindEx = rt_unwind_ex
+RtlUnwind = rt_unwind
+__C_specific_handler = rt_c_specific_handler
