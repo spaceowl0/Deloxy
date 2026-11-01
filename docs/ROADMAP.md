@@ -335,6 +335,7 @@ Exit criteria:
 - [x] P15  writable hierarchical persistent filesystem (DeloxyStore v2: dirs, symlinks, modes, atomic rename, multi-extent files, crash-safe COW commits, v1 migration; `/store`, `/home`, `/var`... for Linux, Win32 and the shell)
 - [x] P16  Windows DLL loading (static imports of DLL files, ordinals, forwarders, dependency chains, relocation, `DllMain` via user-mode stubs, LoadLibrary/GetProcAddress/FreeLibrary with reload)
 - [x] P17  CPU faults as signals (SIGSEGV/SIGFPE/SIGILL with siginfo, `sigaltstack`, restart after handler, default/ignored/blocked = kill)
+- [x] P25  Table-based Windows SEH: `.pdata` unwinder runtime (`deloxy_seh.dll`), RtlUnwindEx, `__C_specific_handler`, mingw C++ exceptions (`user/poc/win_cpp.cc`, `win_unwind.c`, `win_scope.c`)
 - [x] P24  Process groups/sessions, group kill/wait, SIGSTOP/SIGTSTP/SIGCONT + WUNTRACED/WCONTINUED, Ctrl-C to the foreground program (`user/poc/linux_jobs.c`)
 - [x] P23  Interruptible console reads (partial line survives) and `connect` (`user/poc/linux_tty.c`)
 - [x] P22  Thread-directed signals: tkill/tgkill/pthread_kill, per-thread pending sets, thread registry (`user/poc/linux_tsig.c`)
@@ -342,8 +343,8 @@ Exit criteria:
 - [x] P20  Windows exception dispatch: vectored handlers, `SetUnhandledExceptionFilter`, `RaiseException`, real EXCEPTION_RECORD/CONTEXT with resume (`abi/win_exc.rs`, `user/poc/win_seh.c`)
 - [x] P19  Asynchronous signal delivery on timer interrupts (full-register frames, `iret_trapframe`), `getppid` fixed; `user/poc/linux_async.c`
 - [x] P18  Files app browses the hierarchical store (folders, `..`, Backspace, New folder, Delete for empty folders; `tools/files-test.py` 25 checks)
-0. SIGBUS/SIGTRAP/FP exceptions, process groups/job control (so data trees like Python's stdlib work), `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
-0b. **Table-based Windows SEH** (`.pdata` unwind, `__try/__except`, `RtlUnwind`; vectored handlers/filter are done in P20), DLL thread notifications + TLS, delay-load imports, process-exit `DLL_PROCESS_DETACH`.
+0. SIGBUS/SIGTRAP/FP exceptions, controlling-terminal job control (`tcsetpgrp`, SIGTTIN/SIGTTOU, Ctrl-Z and `jobs/fg/bg` in deloxy-sh; groups, stop/continue and Ctrl-C are done in P24), `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
+0b. Windows: epilogue-aware unwinding, unwind info v2, `RtlAddFunctionTable`, clang/MSVC-built SEH test programs, libstdc++-6.dll/libgcc_s_seh-1.dll dynamic linking, DLL thread notifications + TLS, delay-load imports, process-exit `DLL_PROCESS_DETACH`.
 (old item, now done) **Crypto-quality entropy** (`getrandom`, RDSEED/RDRAND + virtio-rng + jitter pool) so ported TLS stacks are safe; then ship a TLS-capable sample (mbedTLS/BearSSL static) as a test program.
 2. **Floating point in the shim ABI** (xmm0/xmm1 args and returns for Windows, math functions, `%f`/`atof`), needed by most real applications.
 3. USB: external hubs, mass storage (bulk transfers, then a read-only FAT driver), then audio class. NVMe driver. e1000e / virtio-gpu / UEFI GOP resize.
