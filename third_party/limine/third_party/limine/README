@@ -1,0 +1,3 @@
+Limine bootloader v8.x binary release files (BSD-2-Clause, see LICENSE), x86-64 BIOS + UEFI only.
+Upstream: https://github.com/limine-bootloader/limine (branch v8.x-binary). limine.c is the host tool
+that tools/mkiso.sh compiles (cc) to install the BIOS boot sector into the ISO.
