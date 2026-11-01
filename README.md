@@ -3,7 +3,7 @@
 A from-scratch x86-64 kernel in Rust (`#![no_std]`), booted by Limine (BIOS + UEFI). **Alpha: it is a research kernel, not a daily-driver OS.**
 
 What it has: preemptive multitasking and ring 3, capability security (no ambient authority), zero-copy shared-memory IPC, a lockless audit stream,
-a graphical desktop (**deloxy-de**, with an on-screen terminal), loaders for native ELF, Linux ELF and Windows PE programs (including **user DLLs**: static imports, `LoadLibrary`/`GetProcAddress`, `DllMain`), CPU faults delivered as **SIGSEGV/SIGFPE/SIGILL** with `sigaltstack`, a read-only initramfs plus a **writable hierarchical persistent filesystem** (`/store`, `/home`, `/var`, ...),
+a graphical desktop (**deloxy-de**, with an on-screen terminal), loaders for native ELF, Linux ELF and Windows PE programs (including **user DLLs**: static imports, `LoadLibrary`/`GetProcAddress`, `DllMain`), Linux programs with fork/exec, threads, sockets and **asynchronous signals** (per-thread masks, `pthread_kill`, process groups, stop/continue, Ctrl-C), CPU faults delivered as **SIGSEGV/SIGFPE/SIGILL** with `sigaltstack`, Windows **vectored exception handling** (`AddVectoredExceptionHandler`, `SetUnhandledExceptionFilter`, `RaiseException`), a read-only initramfs plus a **writable hierarchical persistent filesystem** (`/store`, `/home`, `/var`, ...),
 a shell (**deloxy-sh**), a stats monitor, and **air-gapped-by-default networking**: the NIC stays reset and silent until you explicitly grant
 time-boxed access to one host and port, every frame goes through a default-deny firewall, and a pull-only updater (**deloxy-upd**) accepts only
 Ed25519-signed manifests. Read `docs/KNOWN_ISSUES.md` and `docs/SECURITY.md` before trusting any of it.
@@ -28,9 +28,12 @@ signature, and drops the network again. (The compiled-in update key is a public 
 Needs the pinned nightly in `rust-toolchain.toml` (+ `rust-src`), `qemu-system-x86`, `xorriso`, `python3`, a C compiler (and `ovmf` for UEFI tests). Dependencies are vendored (`vendor/`, offline).
 ```
 tools/make-release.sh      # -> dist/deloxy-0.1.0-alpha.iso, deloxy-core-0.1.0-alpha.elf, SHA256SUMS
-tools/test-all.sh          # full QEMU suite: selftest (BIOS/UEFI/NIC/disk), page-fault proof, desktop UI, network+updater, shell and persistent store (BIOS/UEFI), folders + DLLs + CPU-fault signals (2 boots), glibc/MinGW compatibility
+tools/test-all.sh          # full QEMU suite: selftest (BIOS/UEFI/NIC/disk), page-fault proof, desktop UI, network+updater, shell and persistent store (BIOS/UEFI), folders + DLLs + CPU-fault signals (2 boots), glibc/MinGW compatibility incl. signals, job control and Windows exceptions, Files-app folder browsing
 ```
 Honesty note: everything here was developed and tested in a sandbox with the distro's rustc 1.75 and the workarounds in `tools/dev-container/` (see `docs/HANDOFF.md`);
 the pinned-nightly path is the intended one but has not been run by the author. No real hardware has been tested.
 
 Docs: `docs/HANDOFF.md` (architecture + state) - `docs/ABI.md` (syscalls, capabilities) - `docs/SECURITY.md` - `docs/KNOWN_ISSUES.md` - `docs/ROADMAP.md` - `BUILD-OFFLINE.md`
+
+## Status and licence
+Alpha, QEMU-verified only (see `docs/KNOWN_ISSUES.md`, first block, for the current list of limits). The repository includes prebuilt third-party **test binaries** in `user/blobs/` (see `NOTICE`) and throw-away TEST keys (`user/poc/tls/`, the update key in `tools/mock-update-server.py`); none are secrets. Rebuild the post-alpha test programs with `tools/build-testprogs.sh`. **Licence of the Deloxy sources: not chosen yet** (add `LICENSE` before publishing).
