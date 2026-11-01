@@ -98,6 +98,8 @@ pub struct Plan {
     pub modules: Vec<pe::Module>,
     /// PE: (hinst, DllMain) pairs run before the entry point, dependencies first
     pub dll_init: Vec<(u64, u64)>,
+    /// PE executable: SizeOfImage and exception directory (rva, bytes); zeros for ELF
+    pub exe_info: (u64, u32, u32),
 }
 
 /// Where the dynamic linker is mapped (between the program and the mmap area).
@@ -356,6 +358,7 @@ fn build_into(proc: Arc<Process>, name: &str, data: &[u8], main_len: usize, plan
     {
         let mut f = proc.foreign.lock();
         f.image_base = plan.image_base;
+        f.exe_info = plan.exe_info;
         f.brk_base = brk_base;
         f.brk = brk_base;
         f.brk_mapped = brk_base;

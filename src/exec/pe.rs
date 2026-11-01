@@ -95,6 +95,8 @@ pub struct Module {
     pub size: u64,
     /// DllMain (0 = none)
     pub entry: u64,
+    /// exception directory (.pdata): RVA and size in bytes
+    pub pdata: (u32, u32),
     pub exports: Vec<Export>,
     /// LoadLibrary reference count (static imports count as one)
     pub refs: u32,
@@ -121,6 +123,10 @@ pub enum ModRef {
     Known(usize),
     New(usize),
 }
+
+/// Name of the built-in user-mode SEH runtime DLL and the system-DLL imports it provides.
+pub const SEH_RT_NAME: &str = "deloxy_seh";
+pub const SEH_RT_EXPORTS: &[&str] = &["RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlUnwindEx", "RtlUnwind", "__C_specific_handler"];
 
 /// Lower-case base name without directory and without ".dll".
 pub fn norm_name(n: &str) -> String {
@@ -228,9 +234,18 @@ impl<'a> DllCtx<'a> {
         Ok(ModRef::New(idx))
     }
 
-    /// Bind one import: the Win32 shim first, then DLL files.
+    /// Bind one import: the SEH runtime for the unwinder entry points, then the Win32 shim, then DLL files.
     pub fn bind(&mut self, dll: &str, imp: ImportRef) -> Result<u64, ExecError> {
         if let ImportRef::Name(n) = imp {
+            // RtlLookupFunctionEntry / RtlVirtualUnwind / RtlUnwindEx / RtlUnwind come from `deloxy_seh.dll` (a
+            // user-mode runtime, as ntdll is on Windows) when that file exists; otherwise the shim stubs below remain.
+            if SEH_RT_EXPORTS.contains(&n) && nt::is_system_dll(dll) {
+                if let Ok(m) = self.load(SEH_RT_NAME) {
+                    if let Some(a) = self.resolve_export(m, imp, 0) {
+                        return Ok(a);
+                    }
+                }
+            }
             if let Some(a) = nt::resolve(dll, n) {
                 return Ok(a);
             }
@@ -292,6 +307,8 @@ pub enum Mode {
 }
 
 struct Image {
+    /// SizeOfImage and the exception directory (rva, bytes) of an executable
+    exe_info: (u64, u32, u32),
     entry: u64,
     base: u64,
     segments: Vec<Segment>,
@@ -375,6 +392,7 @@ pub fn plan(d: &[u8], finder: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Plan, 
         dll_bytes: if blobs.is_empty() { None } else { Some(blobs) },
         modules,
         dll_init,
+        exe_info: img.exe_info,
     })
 }
 
@@ -497,7 +515,7 @@ fn plan_image(d: &[u8], mode: Mode, ctx: &mut DllCtx) -> Result<Image, ExecError
         let (exp_rva, exp_size) = dir(0)?;
         let exports = parse_exports(d, &secs, size_of_headers, exp_rva, exp_size)?;
         let entry = if entry_rva != 0 { base.checked_add(entry_rva).ok_or(ExecError::BadRange)? } else { 0 };
-        ctx.mods.push(DllPlan { module: Module { name: name.clone(), base, size: size_of_image, entry, exports, refs: 1, attached: false }, bytes: Vec::new(), segments: Vec::new(), patches: Vec::new() });
+        ctx.mods.push(DllPlan { module: Module { name: name.clone(), base, size: size_of_image, entry, pdata: dir(3)?, exports, refs: 1, attached: false }, bytes: Vec::new(), segments: Vec::new(), patches: Vec::new() });
         Some(ctx.mods.len() - 1)
     } else {
         None
@@ -584,5 +602,5 @@ fn plan_image(d: &[u8], mode: Mode, ctx: &mut DllCtx) -> Result<Image, ExecError
         ctx.mods[i].patches = core::mem::take(&mut patches);
         ctx.init_order.push(i);
     }
-    Ok(Image { entry: base.checked_add(entry_rva).ok_or(ExecError::BadRange)?, base, segments, patches, tls, idx })
+    Ok(Image { exe_info: (size_of_image, dir(3)?.0, dir(3)?.1), entry: base.checked_add(entry_rva).ok_or(ExecError::BadRange)?, base, segments, patches, tls, idx })
 }

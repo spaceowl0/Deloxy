@@ -141,7 +141,11 @@ pub static SHIMS: &[(&str, Shim)] = &[
     ("RemoveVectoredExceptionHandler", super::win_exc::remove_veh),
     ("__DeloxyExcReturn", super::win_exc::exc_return_stub),
     ("UnhandledExceptionFilter", x::zero),
-    ("RtlCaptureContext", x::rtl_capture_context),
+    ("RtlCaptureContext", x::zero),
+    ("RtlRestoreContext", x::zero),
+    ("__DeloxyModuleInfo", super::win_exc::module_info),
+    ("__DeloxyRegisterSeh", super::win_exc::register_seh),
+    ("GetThreadId", wt::get_thread_id),
     ("RtlLookupFunctionEntry", x::zero),
     ("RtlVirtualUnwind", x::zero),
     ("RtlUnwindEx", x::zero),
@@ -895,6 +899,10 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
                 super::win_exc::raise(&p, f, args);
             } else if *name == "__DeloxyExcReturn" {
                 super::win_exc::exc_return(&p, f, args[0]);
+            } else if *name == "RtlCaptureContext" {
+                super::win_exc::capture_context(&p, f, args[0]);
+            } else if *name == "RtlRestoreContext" {
+                super::win_exc::restore_context(&p, args[0]);
             }
             let r = func(&p, args) as i64;
             if core::mem::take(&mut p.foreign.lock().pending_init) {

@@ -69,6 +69,9 @@ pub struct ForeignState {
     pub dll_next: u64,
     /// PE: a LoadLibrary/FreeLibrary left DllMain calls queued (the syscall returns through the continuation stub)
     pub pending_init: bool,
+    /// PE: SizeOfImage and exception directory (rva, bytes) of the executable; the SEH runtime's frame dispatcher
+    pub exe_info: (u64, u32, u32),
+    pub seh_dispatch: u64,
     /// process group / session ids (0 = the process's own pid: a program started by the shell leads its own group and session)
     pub pgid: u64,
     pub sid: u64,
@@ -209,6 +212,8 @@ impl ForeignState {
         self.pending_init = false;
         self.veh.clear();
         self.ueh = 0;
+        self.seh_dispatch = 0;
+        self.exe_info = (0, 0, 0);
         self.brk_base_hint = 0;
         self.brk_base = 0;
         self.brk = 0;
@@ -251,6 +256,8 @@ impl ForeignState {
             modules: alloc::vec::Vec::new(),
             dll_next: 0,
             pending_init: false,
+            exe_info: (0, 0, 0),
+            seh_dispatch: 0,
             pgid: 0,
             sid: 0,
             stopped: false,

@@ -327,6 +327,19 @@ pub fn switch_to_thread(_: &Arc<Process>, _: A) -> u64 {
     task::yield_now();
     1
 }
+/// GetThreadId(handle): the id of a thread handle (the pseudo handle means the caller).
+pub fn get_thread_id(p: &Arc<Process>, a: A) -> u64 {
+    if a[0] == u64::MAX - 1 {
+        return crate::task::current_ids().1;
+    }
+    let Some(i) = obj_slot(a[0]) else { return 0 };
+    let f = p.foreign.lock();
+    if let Some(Some(KObj::Thread { tid, .. })) = f.kobjs.get(i) {
+        return *tid as u64;
+    }
+    0
+}
+
 pub fn get_current_thread(_: &Arc<Process>, _: A) -> u64 {
     u64::MAX - 1 // pseudo handle (-2)
 }

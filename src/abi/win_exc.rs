@@ -81,17 +81,85 @@ pub fn exc_return_stub(_p: &Arc<Process>, _a: [u64; 4]) -> u64 {
     0
 }
 
-/// Handler number `idx` of the chain: the vectored handlers, then the unhandled-exception filter.
+/// Handler number `idx` of the chain: the vectored handlers, then the SEH runtime's frame dispatcher (walks the
+/// `.pdata` unwind tables and calls the language handlers; present once `deloxy_seh.dll` is loaded), then the
+/// unhandled-exception filter.
 fn pick(p: &Arc<Process>, idx: u64) -> Option<(u64, bool)> {
     let g = p.foreign.lock();
     let i = idx as usize;
-    if i < g.veh.len() {
+    let n = g.veh.len();
+    let has_disp = g.seh_dispatch != 0;
+    if i < n {
         Some((g.veh[i].1, false))
-    } else if i == g.veh.len() && g.ueh != 0 {
+    } else if has_disp && i == n {
+        Some((g.seh_dispatch, false))
+    } else if i == n + has_disp as usize && g.ueh != 0 {
         Some((g.ueh, true))
     } else {
         None
     }
+}
+
+/// `__DeloxyModuleInfo(pc, out*)`: which loaded image contains `pc`? out = { image base, .pdata VA, .pdata bytes,
+/// SizeOfImage }. Returns 1 when found (an image without a `.pdata` gives zeros there).
+pub fn module_info(p: &Arc<Process>, a: [u64; 4]) -> u64 {
+    let pc = a[0];
+    let found = {
+        let g = p.foreign.lock();
+        let (esize, erva, elen) = g.exe_info;
+        let mut r: Option<(u64, u64, u64, u64)> = None;
+        if esize != 0 && pc >= g.image_base && pc < g.image_base + esize {
+            r = Some((g.image_base, if elen != 0 { g.image_base + erva as u64 } else { 0 }, elen as u64, esize));
+        } else if let Some(m) = g.modules.iter().find(|m| m.attached && pc >= m.base && pc < m.base + m.size) {
+            r = Some((m.base, if m.pdata.1 != 0 { m.base + m.pdata.0 as u64 } else { 0 }, m.pdata.1 as u64, m.size));
+        }
+        r
+    };
+    let Some((base, pva, plen, size)) = found else { return 0 };
+    let mut b = [0u8; 32];
+    put(&mut b, 0, base);
+    put(&mut b, 8, pva);
+    put(&mut b, 16, plen);
+    put(&mut b, 24, size);
+    if copy_to_user(p, a[1], &b).is_err() {
+        return 0;
+    }
+    1
+}
+
+/// `__DeloxyRegisterSeh(dispatcher)`: the SEH runtime announces its frame dispatcher (called from its DllMain).
+pub fn register_seh(p: &Arc<Process>, a: [u64; 4]) -> u64 {
+    if is_user(a[0]) && a[0] != 0 {
+        p.foreign.lock().seh_dispatch = a[0];
+        1
+    } else {
+        0
+    }
+}
+
+/// `RtlCaptureContext(ctx)`: the caller's register state at the call (rip = return address, rsp = after the return).
+pub fn capture_context(p: &Arc<Process>, f: &SyscallFrame, ctx: u64) {
+    let mut tf = tf_from_syscall(f);
+    let mut ra = [0u8; 8];
+    if copy_from_user(p, &mut ra, f.rsp).is_ok() {
+        tf.rip = u64::from_le_bytes(ra);
+        tf.rsp = f.rsp.wrapping_add(8);
+    }
+    let c = context_from(&tf);
+    let _ = copy_to_user(p, ctx, &c);
+}
+
+/// `RtlRestoreContext(ctx, rec)`: continue with the register state in `ctx`; does not return.
+pub fn restore_context(p: &Arc<Process>, ctx: u64) {
+    let mut c = alloc::vec![0u8; CTX_LEN as usize];
+    if copy_from_user(p, &mut c, ctx).is_ok() {
+        if let Some(tf) = tf_from_context(&c) {
+            // SAFETY: validated user state, user selectors, sanitised rflags.
+            unsafe { crate::arch::x86_64::idt::iret_trapframe(&tf) }
+        }
+    }
+    log::warn!("win: RtlRestoreContext with an invalid context - terminating");
+    crate::task::kill_current_process(crate::sys::errno::EXIT_FAULT_GP)
 }
 
 fn user_frame_selectors() -> (u64, u64) {
