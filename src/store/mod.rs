@@ -40,16 +40,31 @@ pub const COMP_MAX: usize = 255;
 pub const PATH_MAX: usize = 4096;
 /// Maximum number of inodes (files + directories + symlinks), root included.
 pub const MAX_FILES: usize = 20_000;
-pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_EXTENTS: usize = 64;
-pub const MAX_META_BYTES: usize = 4 * 1024 * 1024;
+/// On-disk limit for one file (the disk size and the metadata image are the practical limits).
+pub const MAX_FILE_BYTES: usize = 1 << 40;
+/// Limit for the whole-file `Vec` API (`read`/`write`); bigger files use `read_at`/`write_at`/`truncate`.
+pub const MAX_INMEM_BYTES: usize = 32 * 1024 * 1024;
+/// Integrity granule: every file carries one CRC-32 per 64 KiB chunk, so a range can be verified without
+/// reading the whole file.
+pub const CHUNK: usize = 64 * 1024;
+const CHUNK_U: u64 = CHUNK as u64;
+const CHUNK_SECT: u64 = (CHUNK / SECTOR) as u64;
+pub const MAX_EXTENTS: usize = 1 << 16;
+const ALLOC_FRAGS: usize = 4096;
+pub const MAX_META_BYTES: usize = 32 * 1024 * 1024;
 pub const SYMLINK_MAX: usize = 1024;
 pub const ROOT: u32 = 1;
 const MAX_HOPS: usize = 16;
 const SB_MAGIC: &[u8; 8] = b"DLXSTORE";
 const DIR_MAGIC: &[u8; 8] = b"DLXDIR01";
 const ROOT_MAGIC: &[u8; 8] = b"DLXRT002";
+const ROOT3_MAGIC: &[u8; 8] = b"DLXRT003";
+/// Commit-log record: 24-byte header (magic, payload length, payload CRC, pad, generation) + payload, padded to a sector.
+const LOG_MAGIC: u32 = 0x3144_474C;
+const LOG_HDR: usize = 24;
+const LOG_PAYLOAD_MAX: usize = 1024 * 1024;
 const META_MAGIC: &[u8; 8] = b"DLXMETA2";
+const META3_MAGIC: &[u8; 8] = b"DLXMETA3";
 const V1_ENTRY_SIZE: usize = 64;
 const VERSION: u32 = 2;
 
@@ -127,8 +142,8 @@ impl BlockDev for crate::drivers::blk::Disk {
     }
 }
 
-const fn make_crc_table() -> [u32; 256] {
-    let mut t = [0u32; 256];
+const fn make_crc_tables() -> [[u32; 256]; 8] {
+    let mut t = [[0u32; 256]; 8];
     let mut i = 0;
     while i < 256 {
         let mut c = i as u32;
@@ -137,19 +152,56 @@ const fn make_crc_table() -> [u32; 256] {
             c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
             k += 1;
         }
-        t[i] = c;
+        t[0][i] = c;
         i += 1;
+    }
+    let mut n = 1;
+    while n < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let p = t[n - 1][i];
+            t[n][i] = (p >> 8) ^ t[0][(p & 0xFF) as usize];
+            i += 1;
+        }
+        n += 1;
     }
     t
 }
-static CRC_TABLE: [u32; 256] = make_crc_table();
+static CRC_TABLE: [[u32; 256]; 8] = make_crc_tables();
 
+/// CRC-32 (IEEE), slice-by-8.
 pub fn crc32(data: &[u8]) -> u32 {
+    let t = &CRC_TABLE;
     let mut c = !0u32;
-    for &b in data {
-        c = CRC_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    let mut it = data.chunks_exact(8);
+    for w in &mut it {
+        let a = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) ^ c;
+        let b = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
+        c = t[7][(a & 0xFF) as usize]
+            ^ t[6][((a >> 8) & 0xFF) as usize]
+            ^ t[5][((a >> 16) & 0xFF) as usize]
+            ^ t[4][(a >> 24) as usize]
+            ^ t[3][(b & 0xFF) as usize]
+            ^ t[2][((b >> 8) & 0xFF) as usize]
+            ^ t[1][((b >> 16) & 0xFF) as usize]
+            ^ t[0][(b >> 24) as usize];
+    }
+    for &b in it.remainder() {
+        c = t[0][((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     !c
+}
+
+fn chunk_crcs(data: &[u8]) -> Vec<u32> {
+    data.chunks(CHUNK).map(crc32).collect()
+}
+
+fn table_crc(chunks: &[u32]) -> u32 {
+    let mut b = Vec::with_capacity(chunks.len() * 4);
+    for c in chunks {
+        b.extend_from_slice(&c.to_le_bytes());
+    }
+    crc32(&b)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,19 +292,21 @@ struct Inode {
     size: u64,
     crc: u32,
     extents: Vec<(u64, u32)>,
+    /// CRC-32 of every 64 KiB chunk (empty for a legacy v2 file, which has one whole-file CRC in `crc`)
+    chunks: Vec<u32>,
     entries: BTreeMap<String, u32>,
     target: String,
 }
 
 impl Inode {
     fn dir(mode: u16, mtime: u64) -> Inode {
-        Inode { kind: Kind::Dir, mode, mtime, size: 0, crc: 0, extents: Vec::new(), entries: BTreeMap::new(), target: String::new() }
+        Inode { kind: Kind::Dir, mode, mtime, size: 0, crc: 0, extents: Vec::new(), chunks: Vec::new(), entries: BTreeMap::new(), target: String::new() }
     }
-    fn file(mode: u16, mtime: u64, size: u64, crc: u32, extents: Vec<(u64, u32)>) -> Inode {
-        Inode { kind: Kind::File, mode, mtime, size, crc, extents, entries: BTreeMap::new(), target: String::new() }
+    fn file(mode: u16, mtime: u64, size: u64, crc: u32, extents: Vec<(u64, u32)>, chunks: Vec<u32>) -> Inode {
+        Inode { kind: Kind::File, mode, mtime, size, crc, extents, chunks, entries: BTreeMap::new(), target: String::new() }
     }
     fn symlink(target: &str, mtime: u64) -> Inode {
-        Inode { kind: Kind::Symlink, mode: 0o777, mtime, size: target.len() as u64, crc: 0, extents: Vec::new(), entries: BTreeMap::new(), target: String::from(target) }
+        Inode { kind: Kind::Symlink, mode: 0o777, mtime, size: target.len() as u64, crc: 0, extents: Vec::new(), chunks: Vec::new(), entries: BTreeMap::new(), target: String::from(target) }
     }
     fn stat(&self, ino: u32) -> Stat {
         Stat { ino, kind: self.kind, mode: self.mode, size: self.size, mtime: self.mtime, crc: self.crc }
@@ -403,38 +457,88 @@ fn contains_dir(tx: &Tx, top: u32, needle: u32) -> bool {
 
 // ------------------------------------------------------------------ on-disk encoding ---
 
+fn encode_inode(o: &mut Vec<u8>, ino: u32, i: &Inode) {
+    o.extend_from_slice(&ino.to_le_bytes());
+    o.push(i.kind.code());
+    o.push(0);
+    o.extend_from_slice(&i.mode.to_le_bytes());
+    o.extend_from_slice(&i.mtime.to_le_bytes());
+    o.extend_from_slice(&i.size.to_le_bytes());
+    o.extend_from_slice(&i.crc.to_le_bytes());
+    match i.kind {
+        Kind::File => {
+            o.extend_from_slice(&(i.extents.len() as u32).to_le_bytes());
+            for (s, n) in &i.extents {
+                o.extend_from_slice(&s.to_le_bytes());
+                o.extend_from_slice(&n.to_le_bytes());
+            }
+            o.extend_from_slice(&(i.chunks.len() as u32).to_le_bytes());
+            for c in &i.chunks {
+                o.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        Kind::Dir => {
+            o.extend_from_slice(&(i.entries.len() as u32).to_le_bytes());
+            for (name, c) in &i.entries {
+                o.extend_from_slice(&c.to_le_bytes());
+                o.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                o.extend_from_slice(name.as_bytes());
+            }
+        }
+        Kind::Symlink => {
+            o.extend_from_slice(&(i.target.len() as u32).to_le_bytes());
+            o.extend_from_slice(i.target.as_bytes());
+        }
+    }
+}
+
 fn encode_meta(merged: &[(u32, &Inode)], next_ino: u32) -> Vec<u8> {
     let mut o: Vec<u8> = Vec::with_capacity(64 + merged.len() * 48);
-    o.extend_from_slice(META_MAGIC);
+    o.extend_from_slice(META3_MAGIC);
     o.extend_from_slice(&(merged.len() as u32).to_le_bytes());
     o.extend_from_slice(&next_ino.to_le_bytes());
     for (ino, i) in merged {
-        o.extend_from_slice(&ino.to_le_bytes());
-        o.push(i.kind.code());
-        o.push(0);
-        o.extend_from_slice(&i.mode.to_le_bytes());
-        o.extend_from_slice(&i.mtime.to_le_bytes());
-        o.extend_from_slice(&i.size.to_le_bytes());
-        o.extend_from_slice(&i.crc.to_le_bytes());
-        match i.kind {
-            Kind::File => {
-                o.extend_from_slice(&(i.extents.len() as u32).to_le_bytes());
-                for (s, n) in &i.extents {
-                    o.extend_from_slice(&s.to_le_bytes());
-                    o.extend_from_slice(&n.to_le_bytes());
-                }
-            }
-            Kind::Dir => {
-                o.extend_from_slice(&(i.entries.len() as u32).to_le_bytes());
-                for (name, c) in &i.entries {
+        encode_inode(&mut o, *ino, i);
+    }
+    o
+}
+
+/// The changes of one commit as a log payload: next inode counter, then per inode `1` + full inode or `0` + number.
+fn encode_delta(ov: &BTreeMap<u32, Option<Inode>>, old: &BTreeMap<u32, Inode>, next_ino: u32) -> Vec<u8> {
+    let mut o: Vec<u8> = Vec::with_capacity(64 + ov.len() * 64);
+    o.extend_from_slice(&next_ino.to_le_bytes());
+    o.extend_from_slice(&(ov.len() as u32).to_le_bytes());
+    for (ino, v) in ov {
+        match v {
+            Some(i) if i.kind == Kind::Dir && old.get(ino).map_or(false, |p| p.kind == Kind::Dir) => {
+                // a directory that already exists: log only the entries that changed (a big directory must not be
+                // written whole on every create/unlink)
+                let prev = &old[ino];
+                o.push(2);
+                o.extend_from_slice(&ino.to_le_bytes());
+                o.extend_from_slice(&i.mode.to_le_bytes());
+                o.extend_from_slice(&i.mtime.to_le_bytes());
+                let adds: Vec<(&String, &u32)> = i.entries.iter().filter(|(n, c)| prev.entries.get(*n) != Some(*c)).collect();
+                let dels: Vec<&String> = prev.entries.keys().filter(|n| !i.entries.contains_key(*n)).collect();
+                o.extend_from_slice(&(adds.len() as u32).to_le_bytes());
+                for (n, c) in adds {
                     o.extend_from_slice(&c.to_le_bytes());
-                    o.extend_from_slice(&(name.len() as u16).to_le_bytes());
-                    o.extend_from_slice(name.as_bytes());
+                    o.extend_from_slice(&(n.len() as u16).to_le_bytes());
+                    o.extend_from_slice(n.as_bytes());
+                }
+                o.extend_from_slice(&(dels.len() as u32).to_le_bytes());
+                for n in dels {
+                    o.extend_from_slice(&(n.len() as u16).to_le_bytes());
+                    o.extend_from_slice(n.as_bytes());
                 }
             }
-            Kind::Symlink => {
-                o.extend_from_slice(&(i.target.len() as u32).to_le_bytes());
-                o.extend_from_slice(i.target.as_bytes());
+            Some(i) => {
+                o.push(1);
+                encode_inode(&mut o, *ino, i);
+            }
+            None => {
+                o.push(0);
+                o.extend_from_slice(&ino.to_le_bytes());
             }
         }
     }
@@ -467,10 +571,125 @@ impl<'a> Rd<'a> {
     }
 }
 
-/// Decode and fully validate a metadata image (structure, extents, tree shape). `None` on any inconsistency.
-fn decode_meta(img: &[u8], total: u64) -> Option<(BTreeMap<u32, Inode>, u32)> {
+fn decode_inode(r: &mut Rd, v3: bool, next_ino: u32, total: u64) -> Option<(u32, Inode)> {
+    let ino = r.u32()?;
+    let kind = Kind::from_code(r.u8()?)?;
+    let _ = r.u8()?;
+    let mode = r.u16()? & 0o7777;
+    let mtime = r.u64()?;
+    let size = r.u64()?;
+    let crc = r.u32()?;
+    let aux = r.u32()? as usize;
+    if ino == 0 || ino >= next_ino {
+        return None;
+    }
+    let inode = match kind {
+        Kind::File => {
+            if aux > MAX_EXTENTS || size > MAX_FILE_BYTES as u64 {
+                return None;
+            }
+            if aux == 0 && size > 0 {
+                return None;
+            }
+            let mut ex = Vec::with_capacity(aux);
+            let mut sum = 0u64;
+            for _ in 0..aux {
+                let s = r.u64()?;
+                let n = r.u32()?;
+                let e = s.checked_add(n as u64)?;
+                if n == 0 || s < DATA_START || e > total {
+                    return None;
+                }
+                sum += n as u64;
+                ex.push((s, n));
+            }
+            if sum != sectors_for(size) {
+                return None;
+            }
+            let mut chunks = Vec::new();
+            if v3 {
+                let nc = r.u32()? as usize;
+                // nc == 0 with data: a legacy file migrated from v1/v2 (its `crc` is the whole-file CRC)
+                if nc as u64 != size.div_ceil(CHUNK_U) && nc != 0 {
+                    return None;
+                }
+                chunks.reserve(nc);
+                for _ in 0..nc {
+                    chunks.push(r.u32()?);
+                }
+            }
+            Inode::file(mode, mtime, size, crc, ex, chunks)
+        }
+        Kind::Dir => {
+            if aux > MAX_FILES {
+                return None;
+            }
+            let mut d = Inode::dir(mode, mtime);
+            for _ in 0..aux {
+                let c = r.u32()?;
+                let nl = r.u16()? as usize;
+                let name = core::str::from_utf8(r.take(nl)?).ok()?;
+                if !valid_component(name) || d.entries.insert(String::from(name), c).is_some() {
+                    return None;
+                }
+            }
+            d
+        }
+        Kind::Symlink => {
+            if aux == 0 || aux > SYMLINK_MAX || size != aux as u64 {
+                return None;
+            }
+            let t = core::str::from_utf8(r.take(aux)?).ok()?;
+            Inode::symlink(t, mtime)
+        }
+    };
+    Some((ino, inode))
+}
+
+fn validate_tree(map: &BTreeMap<u32, Inode>) -> bool {
+    // tree shape: root is a directory, every other inode is referenced exactly once, everything is reachable
+    if map.get(&ROOT).map(|i| i.kind) != Some(Kind::Dir) {
+        return false;
+    }
+    let mut refs: BTreeMap<u32, u32> = BTreeMap::new();
+    for i in map.values() {
+        for c in i.entries.values() {
+            if *c == ROOT || !map.contains_key(c) {
+                return false;
+            }
+            *refs.entry(*c).or_insert(0) += 1;
+        }
+    }
+    if refs.len() != map.len() - 1 || refs.values().any(|&n| n != 1) {
+        return false;
+    }
+    let mut seen = 0usize;
+    let mut work = vec![ROOT];
+    while let Some(d) = work.pop() {
+        seen += 1;
+        if seen > map.len() {
+            return false; // cycle
+        }
+        work.extend(map[&d].entries.values().copied());
+    }
+    if seen != map.len() {
+        return false;
+    }
+    // extents must not overlap
+    let mut ext: Vec<(u64, u64)> = map.values().flat_map(|i| i.extents.iter().map(|&(s, n)| (s, s + n as u64))).collect();
+    ext.sort();
+    if ext.windows(2).any(|w| w[0].1 > w[1].0) {
+        return false;
+    }
+    true
+}
+
+/// Parse a checkpoint image (no tree validation: a commit log may still have to be replayed on top).
+fn decode_meta_raw(img: &[u8], total: u64) -> Option<(BTreeMap<u32, Inode>, u32)> {
     let mut r = Rd { b: img, p: 0 };
-    if r.take(8)? != META_MAGIC {
+    let magic = r.take(8)?;
+    let v3 = magic == META3_MAGIC;
+    if !v3 && magic != META_MAGIC {
         return None;
     }
     let count = r.u32()? as usize;
@@ -480,62 +699,7 @@ fn decode_meta(img: &[u8], total: u64) -> Option<(BTreeMap<u32, Inode>, u32)> {
     }
     let mut map: BTreeMap<u32, Inode> = BTreeMap::new();
     for _ in 0..count {
-        let ino = r.u32()?;
-        let kind = Kind::from_code(r.u8()?)?;
-        let _ = r.u8()?;
-        let mode = r.u16()? & 0o7777;
-        let mtime = r.u64()?;
-        let size = r.u64()?;
-        let crc = r.u32()?;
-        let aux = r.u32()? as usize;
-        if ino == 0 || ino >= next_ino {
-            return None;
-        }
-        let inode = match kind {
-            Kind::File => {
-                if aux > MAX_EXTENTS || size > MAX_FILE_BYTES as u64 {
-                    return None;
-                }
-                let mut ex = Vec::with_capacity(aux);
-                let mut sum = 0u64;
-                for _ in 0..aux {
-                    let s = r.u64()?;
-                    let n = r.u32()?;
-                    let e = s.checked_add(n as u64)?;
-                    if n == 0 || s < DATA_START || e > total {
-                        return None;
-                    }
-                    sum += n as u64;
-                    ex.push((s, n));
-                }
-                if sum != sectors_for(size) {
-                    return None;
-                }
-                Inode::file(mode, mtime, size, crc, ex)
-            }
-            Kind::Dir => {
-                if aux > MAX_FILES {
-                    return None;
-                }
-                let mut d = Inode::dir(mode, mtime);
-                for _ in 0..aux {
-                    let c = r.u32()?;
-                    let nl = r.u16()? as usize;
-                    let name = core::str::from_utf8(r.take(nl)?).ok()?;
-                    if !valid_component(name) || d.entries.insert(String::from(name), c).is_some() {
-                        return None;
-                    }
-                }
-                d
-            }
-            Kind::Symlink => {
-                if aux == 0 || aux > SYMLINK_MAX || size != aux as u64 {
-                    return None;
-                }
-                let t = core::str::from_utf8(r.take(aux)?).ok()?;
-                Inode::symlink(t, mtime)
-            }
-        };
+        let (ino, inode) = decode_inode(&mut r, v3, next_ino, total)?;
         if map.insert(ino, inode).is_some() {
             return None;
         }
@@ -543,53 +707,120 @@ fn decode_meta(img: &[u8], total: u64) -> Option<(BTreeMap<u32, Inode>, u32)> {
     if r.p != img.len() {
         return None;
     }
-    // tree shape: root is a directory, every other inode is referenced exactly once, everything is reachable
-    if map.get(&ROOT)?.kind != Kind::Dir {
-        return None;
-    }
-    let mut refs: BTreeMap<u32, u32> = BTreeMap::new();
-    for i in map.values() {
-        for c in i.entries.values() {
-            if *c == ROOT || !map.contains_key(c) {
-                return None;
-            }
-            *refs.entry(*c).or_insert(0) += 1;
-        }
-    }
-    if refs.len() != map.len() - 1 || refs.values().any(|&n| n != 1) {
-        return None;
-    }
-    let mut seen = 0usize;
-    let mut work = vec![ROOT];
-    while let Some(d) = work.pop() {
-        seen += 1;
-        if seen > map.len() {
-            return None; // cycle
-        }
-        work.extend(map[&d].entries.values().copied());
-    }
-    if seen != map.len() {
-        return None;
-    }
-    // extents must not overlap
-    let mut ext: Vec<(u64, u64)> = map.values().flat_map(|i| i.extents.iter().map(|&(s, n)| (s, s + n as u64))).collect();
-    ext.sort();
-    if ext.windows(2).any(|w| w[0].1 > w[1].0) {
-        return None;
-    }
     Some((map, next_ino))
 }
 
-fn encode_root(gen: u64, mstart: u64, mlen: u32, mcrc: u32, next_ino: u32) -> Vec<u8> {
+/// Apply one log payload to the tree; returns the new next-inode counter.
+fn apply_delta(map: &mut BTreeMap<u32, Inode>, payload: &[u8], total: u64, prev_next: u32) -> Option<u32> {
+    let mut r = Rd { b: payload, p: 0 };
+    let next_ino = r.u32()?;
+    if next_ino < prev_next {
+        return None;
+    }
+    let count = r.u32()? as usize;
+    if count > MAX_FILES {
+        return None;
+    }
+    for _ in 0..count {
+        match r.u8()? {
+            1 => {
+                let (ino, inode) = decode_inode(&mut r, true, next_ino, total)?;
+                map.insert(ino, inode);
+            }
+            0 => {
+                let ino = r.u32()?;
+                map.remove(&ino)?;
+            }
+            2 => {
+                let ino = r.u32()?;
+                let mode = r.u16()? & 0o7777;
+                let mtime = r.u64()?;
+                let d = map.get_mut(&ino)?;
+                if d.kind != Kind::Dir {
+                    return None;
+                }
+                d.mode = mode;
+                d.mtime = mtime;
+                for _ in 0..r.u32()? {
+                    let c = r.u32()?;
+                    let nl = r.u16()? as usize;
+                    let name = core::str::from_utf8(r.take(nl)?).ok()?;
+                    if !valid_component(name) || c == 0 || c >= next_ino {
+                        return None;
+                    }
+                    d.entries.insert(String::from(name), c);
+                }
+                for _ in 0..r.u32()? {
+                    let nl = r.u16()? as usize;
+                    let name = core::str::from_utf8(r.take(nl)?).ok()?;
+                    d.entries.remove(name)?;
+                }
+            }
+            _ => return None,
+        }
+    }
+    (r.p == payload.len()).then_some(next_ino)
+}
+
+/// Replay `buf` (the used part of the log) on top of a checkpoint made at generation `ckpt_gen`; the last record must
+/// carry `root_gen`. Returns the final next-inode counter.
+fn replay_log(map: &mut BTreeMap<u32, Inode>, buf: &[u8], ckpt_gen: u64, root_gen: u64, total: u64, mut next: u32) -> Option<u32> {
+    let mut p = 0usize;
+    let mut g = ckpt_gen;
+    while p < buf.len() {
+        if buf.len() - p < LOG_HDR {
+            return None;
+        }
+        let h = &buf[p..p + LOG_HDR];
+        if u32::from_le_bytes(h[0..4].try_into().ok()?) != LOG_MAGIC {
+            return None;
+        }
+        let len = u32::from_le_bytes(h[4..8].try_into().ok()?) as usize;
+        let crc = u32::from_le_bytes(h[8..12].try_into().ok()?);
+        let gen = u64::from_le_bytes(h[16..24].try_into().ok()?);
+        g += 1;
+        if gen != g || len > LOG_PAYLOAD_MAX {
+            return None;
+        }
+        let rs = sectors_for((LOG_HDR + len) as u64) as usize * SECTOR;
+        if p + rs > buf.len() {
+            return None;
+        }
+        let payload = &buf[p + LOG_HDR..p + LOG_HDR + len];
+        if crc32(payload) != crc {
+            return None;
+        }
+        next = apply_delta(map, payload, total, next)?;
+        p += rs;
+    }
+    (g == root_gen).then_some(next)
+}
+
+/// Decode and fully validate a metadata image (structure, extents, tree shape). `None` on any inconsistency.
+fn decode_meta(img: &[u8], total: u64) -> Option<(BTreeMap<u32, Inode>, u32)> {
+    let (map, next) = decode_meta_raw(img, total)?;
+    validate_tree(&map).then_some((map, next))
+}
+
+/// Root record (one sector). `ckpt_gen` is the generation of the checkpoint image `(mstart, mlen, mcrc, ckpt_next)`
+/// (`mstart2` = an identical mirror copy, 0 if none, used when the primary image fails its CRC);
+/// `log = (start, capacity, used)` in sectors is the commit log appended after it (records ckpt_gen+1 ..= gen).
+#[allow(clippy::too_many_arguments)]
+fn encode_root(gen: u64, ckpt_gen: u64, mstart: u64, mstart2: u64, mlen: u32, mcrc: u32, ckpt_next: u32, log: (u64, u64, u64)) -> Vec<u8> {
     let mut s = vec![0u8; SECTOR];
-    s[0..8].copy_from_slice(ROOT_MAGIC);
+    s[0..8].copy_from_slice(ROOT3_MAGIC);
     s[8..16].copy_from_slice(&gen.to_le_bytes());
     s[16..24].copy_from_slice(&mstart.to_le_bytes());
     s[24..28].copy_from_slice(&mlen.to_le_bytes());
     s[28..32].copy_from_slice(&mcrc.to_le_bytes());
-    s[32..36].copy_from_slice(&next_ino.to_le_bytes());
-    let c = crc32(&s[0..40]);
-    s[40..44].copy_from_slice(&c.to_le_bytes());
+    s[32..36].copy_from_slice(&ckpt_next.to_le_bytes());
+    s[40..48].copy_from_slice(&ckpt_gen.to_le_bytes());
+    s[48..56].copy_from_slice(&log.0.to_le_bytes());
+    s[56..60].copy_from_slice(&(log.1 as u32).to_le_bytes());
+    s[60..64].copy_from_slice(&(log.2 as u32).to_le_bytes());
+    s[64..72].copy_from_slice(&mstart2.to_le_bytes());
+    let c = crc32(&s[0..72]);
+    s[72..76].copy_from_slice(&c.to_le_bytes());
     s
 }
 
@@ -620,9 +851,6 @@ fn decode_dir_v1(img: &[u8], total: u64) -> Option<(u64, Vec<(String, u64, u64, 
         let start = u64::from_le_bytes(img[o + 48..o + 56].try_into().ok()?);
         let size = u32::from_le_bytes(img[o + 56..o + 60].try_into().ok()?) as u64;
         let crc = u32::from_le_bytes(img[o + 60..o + 64].try_into().ok()?);
-        if size as usize > MAX_FILE_BYTES {
-            return None;
-        }
         if size > 0 {
             let end = start.checked_add(sectors_for(size))?;
             if start < DATA_START || end > total {
@@ -646,7 +874,7 @@ fn tree_from_v1(files: &[(String, u64, u64, u32)]) -> (BTreeMap<u32, Inode>, u32
     for (name, start, size, crc) in files {
         let ex = if *size > 0 { vec![(*start, sectors_for(*size) as u32)] } else { Vec::new() };
         root.entries.insert(name.clone(), next);
-        map.insert(next, Inode::file(0o644, 0, *size, *crc, ex));
+        map.insert(next, Inode::file(0o644, 0, *size, *crc, ex, Vec::new()));
         next += 1;
     }
     map.insert(ROOT, root);
@@ -655,53 +883,328 @@ fn tree_from_v1(files: &[(String, u64, u64, u32)]) -> (BTreeMap<u32, Inode>, u32
 
 // ------------------------------------------------------------------ allocation ---
 
-/// Free runs of the data area given the extents in use.
-fn free_runs(used: &[(u64, u64)], total: u64) -> Vec<(u64, u64)> {
-    let mut u: Vec<(u64, u64)> = used.to_vec();
-    u.sort();
-    let mut out = Vec::new();
-    let mut pos = DATA_START;
-    for (s, e) in u {
-        if s > pos {
-            out.push((pos, s));
-        }
-        pos = pos.max(e);
+/// Free space of the data area as coalesced runs (`start -> end`, sectors). Allocation takes from it; sectors a
+/// commit stops referencing are given back only after that commit is durable, so "free" always means "not
+/// referenced by the committed tree".
+struct FreeMap {
+    runs: BTreeMap<u64, u64>,
+}
+
+fn split_u32(mut s: u64, mut n: u64) -> Vec<(u64, u32)> {
+    let mut v = Vec::new();
+    while n > 0 {
+        let t = n.min(u32::MAX as u64);
+        v.push((s, t as u32));
+        s += t;
+        n -= t;
     }
-    if total > pos {
-        out.push((pos, total));
+    v
+}
+
+impl FreeMap {
+    fn new(total: u64, used: &mut Vec<(u64, u64)>) -> FreeMap {
+        used.sort();
+        let mut runs = BTreeMap::new();
+        let mut pos = DATA_START;
+        for &(s, e) in used.iter() {
+            if s > pos {
+                runs.insert(pos, s);
+            }
+            pos = pos.max(e);
+        }
+        if total > pos {
+            runs.insert(pos, total);
+        }
+        FreeMap { runs }
+    }
+    fn carve(&mut self, s: u64, take: u64) {
+        if let Some(e) = self.runs.remove(&s) {
+            if s + take < e {
+                self.runs.insert(s + take, e);
+            }
+        }
+    }
+    fn free_sectors(&self) -> u64 {
+        self.runs.iter().map(|(s, e)| e - s).sum()
+    }
+    /// `n` sectors as at most `max_ext` extents: one first-fit run if possible, otherwise the largest runs.
+    fn take(&mut self, n: u64, max_ext: usize) -> Option<Vec<(u64, u32)>> {
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        let hit = self.runs.iter().find(|(&s, &e)| e - s >= n).map(|(&s, _)| s);
+        if let Some(s) = hit {
+            self.carve(s, n);
+            return Some(split_u32(s, n));
+        }
+        if max_ext <= 1 {
+            return None;
+        }
+        let mut by_size: Vec<(u64, u64)> = self.runs.iter().map(|(&s, &e)| (s, e - s)).collect();
+        by_size.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut picked: Vec<(u64, u64)> = Vec::new();
+        let mut got = 0u64;
+        for (s, l) in by_size {
+            if picked.len() >= max_ext || got >= n {
+                break;
+            }
+            let t = l.min(n - got);
+            picked.push((s, t));
+            got += t;
+        }
+        if got < n {
+            return None;
+        }
+        picked.sort();
+        let mut out = Vec::new();
+        for (s, t) in picked {
+            self.carve(s, t);
+            out.extend(split_u32(s, t));
+        }
+        Some(out)
+    }
+    fn give(&mut self, s: u64, e: u64) {
+        if e <= s {
+            return;
+        }
+        let (mut s, mut e) = (s, e);
+        if let Some((&ps, &pe)) = self.runs.range(..=s).next_back() {
+            if pe >= s {
+                s = ps;
+                e = e.max(pe);
+            }
+        }
+        loop {
+            let next = self.runs.range(s..).next().map(|(&a, &b)| (a, b));
+            match next {
+                Some((ns, ne)) if ns <= e => {
+                    e = e.max(ne);
+                    self.runs.remove(&ns);
+                }
+                _ => break,
+            }
+        }
+        self.runs.insert(s, e);
+    }
+    fn give_ext(&mut self, ex: &[(u64, u32)]) {
+        for &(s, n) in ex {
+            self.give(s, s + n as u64);
+        }
+    }
+}
+
+/// Sectors in `old` that `new` no longer references.
+fn freed_ranges(old: &[(u64, u32)], new: &[(u64, u32)]) -> Vec<(u64, u64)> {
+    let mut o: Vec<(u64, u64)> = old.iter().map(|&(s, n)| (s, s + n as u64)).collect();
+    o.sort();
+    if new.is_empty() {
+        return o;
+    }
+    let mut nw: Vec<(u64, u64)> = new.iter().map(|&(s, n)| (s, s + n as u64)).collect();
+    nw.sort();
+    let mut out = Vec::new();
+    let mut j = 0;
+    for (s, e) in o {
+        let mut cur = s;
+        while j < nw.len() && nw[j].1 <= cur {
+            j += 1;
+        }
+        let mut k = j;
+        while k < nw.len() && nw[k].0 < e {
+            if nw[k].0 > cur {
+                out.push((cur, nw[k].0));
+            }
+            cur = cur.max(nw[k].1);
+            k += 1;
+        }
+        if cur < e {
+            out.push((cur, e));
+        }
     }
     out
 }
 
-/// Allocate `n` sectors as at most `max_ext` extents: one first-fit run if possible, otherwise the largest runs.
-fn alloc_extents(used: &[(u64, u64)], total: u64, n: u64, max_ext: usize) -> Option<Vec<(u64, u32)>> {
-    if n == 0 {
-        return Some(Vec::new());
+/// Split an extent list after `at` sectors (the left part has exactly `at` sectors, or everything if shorter).
+fn split_extents(ex: &[(u64, u32)], at: u64) -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
+    let (mut left, mut right) = (Vec::new(), Vec::new());
+    let mut pos = 0u64;
+    for &(s, n) in ex {
+        let n64 = n as u64;
+        if pos + n64 <= at {
+            left.push((s, n));
+        } else if pos >= at {
+            right.push((s, n));
+        } else {
+            let k = at - pos;
+            left.push((s, k as u32));
+            right.push((s + k, (n64 - k) as u32));
+        }
+        pos += n64;
     }
-    let runs = free_runs(used, total);
-    if let Some(&(s, _)) = runs.iter().find(|&&(s, e)| e - s >= n) {
-        return Some(vec![(s, n as u32)]);
+    (left, right)
+}
+
+fn merge_adjacent(ex: Vec<(u64, u32)>) -> Vec<(u64, u32)> {
+    let mut out: Vec<(u64, u32)> = Vec::with_capacity(ex.len());
+    for (s, n) in ex {
+        if n == 0 {
+            continue;
+        }
+        if let Some(l) = out.last_mut() {
+            if l.0 + l.1 as u64 == s && (l.1 as u64 + n as u64) <= u32::MAX as u64 {
+                l.1 += n;
+                continue;
+            }
+        }
+        out.push((s, n));
     }
-    if max_ext <= 1 {
-        return None;
-    }
-    let mut by_size = runs.clone();
-    by_size.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)));
-    let mut picked: Vec<(u64, u64)> = Vec::new();
-    let mut got = 0u64;
-    for (s, e) in by_size {
-        if picked.len() >= max_ext || got >= n {
+    out
+}
+
+/// Read `count` sectors starting at file sector `first` of an extent list into `out` (one device request per extent piece).
+fn read_sectors<D: BlockDev>(dev: &mut D, ex: &[(u64, u32)], first: u64, count: u64, out: &mut [u8]) -> Result<(), StoreErr> {
+    let mut pos = 0u64;
+    let mut done = 0u64;
+    for &(s, n) in ex {
+        let n64 = n as u64;
+        let end = pos + n64;
+        if end > first && done < count {
+            let skip = first.max(pos) - pos;
+            let take = (n64 - skip).min(count - done);
+            dev.read(s + skip, &mut out[(done as usize) * SECTOR..((done + take) as usize) * SECTOR])?;
+            done += take;
+        }
+        pos = end;
+        if done == count {
             break;
         }
-        let take = (e - s).min(n - got);
-        picked.push((s, take));
-        got += take;
     }
-    if got < n {
-        return None;
+    if done != count {
+        return Err(StoreErr::Corrupt);
     }
-    picked.sort();
-    Some(picked.into_iter().map(|(s, l)| (s, l as u32)).collect())
+    Ok(())
+}
+
+/// Write `data` (a multiple of the sector size) starting at file sector `first` of an extent list.
+fn write_sectors<D: BlockDev>(dev: &mut D, ex: &[(u64, u32)], first: u64, data: &[u8]) -> Result<(), StoreErr> {
+    let count = (data.len() / SECTOR) as u64;
+    let mut pos = 0u64;
+    let mut done = 0u64;
+    for &(s, n) in ex {
+        let n64 = n as u64;
+        let end = pos + n64;
+        if end > first && done < count {
+            let skip = first.max(pos) - pos;
+            let take = (n64 - skip).min(count - done);
+            dev.write(s + skip, &data[(done as usize) * SECTOR..((done + take) as usize) * SECTOR])?;
+            done += take;
+        }
+        pos = end;
+        if done == count {
+            break;
+        }
+    }
+    if done != count {
+        return Err(StoreErr::Corrupt);
+    }
+    Ok(())
+}
+
+/// Write the bytes of `data` into freshly allocated `extents` without copying (only a sub-sector tail is padded).
+fn write_data<D: BlockDev>(dev: &mut D, extents: &[(u64, u32)], data: &[u8]) -> Result<(), StoreErr> {
+    let full = data.len() / SECTOR * SECTOR;
+    if full > 0 {
+        write_sectors(dev, extents, 0, &data[..full])?;
+    }
+    if full < data.len() {
+        let mut tail = [0u8; SECTOR];
+        tail[..data.len() - full].copy_from_slice(&data[full..]);
+        write_sectors(dev, extents, (full / SECTOR) as u64, &tail)?;
+    }
+    Ok(())
+}
+
+fn used_list(inodes: &BTreeMap<u32, Inode>, meta: (u64, u64), meta2: u64, log: (u64, u64, u64)) -> Vec<(u64, u64)> {
+    let mut u: Vec<(u64, u64)> = Vec::new();
+    for i in inodes.values() {
+        for &(s, n) in &i.extents {
+            u.push((s, s + n as u64));
+        }
+    }
+    if meta.1 > 0 {
+        u.push((meta.0, meta.0 + meta.1));
+    }
+    if meta2 != 0 {
+        u.push((meta2, meta2 + meta.1));
+    }
+    if log.1 > 0 {
+        u.push((log.0, log.0 + log.1));
+    }
+    u
+}
+
+/// Build the new content of chunks `c0..=c1` (old data merged with `data` at `off`, gaps zero) in batches of at most
+/// 16 chunks, write it into `new_ex` and return the chunk CRCs.
+#[allow(clippy::too_many_arguments)]
+fn build_region<D: BlockDev>(
+    dev: &mut D,
+    oext: &[(u64, u32)],
+    ochunks: &[u32],
+    osize: u64,
+    new_ex: &[(u64, u32)],
+    c0: u64,
+    c1: u64,
+    new_size: u64,
+    off: u64,
+    data: &[u8],
+) -> Result<Vec<u32>, StoreErr> {
+    let end = off + data.len() as u64;
+    let mut crcs: Vec<u32> = Vec::with_capacity((c1 - c0 + 1) as usize);
+    let mut written = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut oldtmp: Vec<u8> = Vec::new();
+    let mut c = c0;
+    while c <= c1 {
+        let be = (c + 15).min(c1);
+        let bstart = c * CHUNK_U;
+        let bend = ((be + 1) * CHUNK_U).min(new_size);
+        let nsect = sectors_for(bend - bstart);
+        buf.clear();
+        buf.resize(nsect as usize * SECTOR, 0);
+        for k in c..=be {
+            let ks = k * CHUNK_U;
+            let ke = (ks + CHUNK_U).min(new_size);
+            let rel = (ks - bstart) as usize;
+            let dst = &mut buf[rel..rel + (ke - ks) as usize];
+            if ks < osize {
+                let old_end = (ks + CHUNK_U).min(osize);
+                let covers = !data.is_empty() && off <= ks && end >= old_end;
+                if !covers {
+                    let olen = old_end - ks;
+                    let ns = sectors_for(olen);
+                    oldtmp.clear();
+                    oldtmp.resize(ns as usize * SECTOR, 0);
+                    read_sectors(dev, oext, k * CHUNK_SECT, ns, &mut oldtmp)?;
+                    if (k as usize) < ochunks.len() && crc32(&oldtmp[..olen as usize]) != ochunks[k as usize] {
+                        return Err(StoreErr::Corrupt);
+                    }
+                    dst[..olen as usize].copy_from_slice(&oldtmp[..olen as usize]);
+                }
+            }
+            if !data.is_empty() {
+                let lo = off.max(ks);
+                let hi = end.min(ke);
+                if lo < hi {
+                    dst[(lo - ks) as usize..(hi - ks) as usize].copy_from_slice(&data[(lo - off) as usize..(hi - off) as usize]);
+                }
+            }
+            crcs.push(crc32(dst));
+        }
+        write_sectors(dev, new_ex, written, &buf)?;
+        written += nsect;
+        c = be + 1;
+    }
+    Ok(crcs)
 }
 
 pub struct Store<D: BlockDev> {
@@ -714,6 +1217,16 @@ pub struct Store<D: BlockDev> {
     next_ino: u32,
     /// committed metadata extent (start, sectors); (0, 0) while a v1 directory is still the committed state
     meta: (u64, u64),
+    /// checkpoint bookkeeping for the root record: (image bytes, image CRC, next inode counter at the checkpoint, checkpoint generation)
+    ck: (u32, u32, u32, u64),
+    /// start of the mirror copy of the checkpoint image (0 = none)
+    meta2: u64,
+    /// commit log extent (start, capacity, used) in sectors; capacity 0 = no log (every commit is a checkpoint)
+    log: (u64, u64, u64),
+    free: FreeMap,
+    /// set when a commit failed after the root record may have reached the disk: the in-memory state can no
+    /// longer be trusted to match the disk, so every further mutation is refused until the next mount
+    poisoned: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -764,11 +1277,20 @@ impl<D: BlockDev> Store<D> {
         // metadata first, then slot B invalidated, slot A written, superblock last: a half-formatted disk has no valid superblock
         dev.write(DATA_START, &padded)?;
         dev.write(1 + DIR_SECTORS, &vec![0u8; SECTOR])?;
-        dev.write(1, &encode_root(1, DATA_START, meta.len() as u32, crc32(&meta), ROOT + 1))?;
+        let meta2 = DATA_START + msect;
+        let log = (meta2 + msect, 128u64, 0u64);
+        if log.0 + log.1 > total {
+            return Err(StoreErr::NoSpace);
+        }
+        dev.write(meta2, &padded)?;
+        let mcrc = crc32(&meta);
+        dev.write(1, &encode_root(1, 1, DATA_START, meta2, meta.len() as u32, mcrc, ROOT + 1, log))?;
         dev.flush()?;
         dev.write(0, &superblock(total))?;
         dev.flush()?;
-        Ok(Store { dev, total, gen: 1, cur_slot: 0, inodes: map, next_ino: ROOT + 1, meta: (DATA_START, msect) })
+        let mut used = vec![(DATA_START, log.0 + log.1)];
+        let free = FreeMap::new(total, &mut used);
+        Ok(Store { dev, total, gen: 1, cur_slot: 0, inodes: map, next_ino: ROOT + 1, meta: (DATA_START, msect), ck: (meta.len() as u32, mcrc, ROOT + 1, 1), meta2, log, free, poisoned: false })
     }
 
     pub fn mount(mut dev: D) -> Result<Store<D>, (StoreErr, D)> {
@@ -785,17 +1307,19 @@ impl<D: BlockDev> Store<D> {
         if crc32(&sb[..SECTOR - 4]) != c || !(ver == 1 || ver == 2) || total > dev.sectors() || total < DATA_START + 8 {
             return Err((StoreErr::Corrupt, dev));
         }
-        // (generation, slot, tree, next inode, metadata extent)
-        let mut best: Option<(u64, u8, BTreeMap<u32, Inode>, u32, (u64, u64))> = None;
+        // (generation, slot, tree, next inode, metadata extent, checkpoint info, log)
+        type Cand = (u64, u8, BTreeMap<u32, Inode>, u32, (u64, u64), u64, (u32, u32, u32, u64), (u64, u64, u64));
+        let mut best: Option<Cand> = None;
         for slot in 0..2u8 {
             let base = 1 + slot as u64 * DIR_SECTORS;
             let mut first = vec![0u8; SECTOR];
             if let Err(e) = dev.read(base, &mut first) {
                 return Err((e.into(), dev));
             }
-            let cand = if &first[0..8] == ROOT_MAGIC {
-                // v2 root record
-                let ok = u32::from_le_bytes(first[40..44].try_into().unwrap()) == crc32(&first[0..40]);
+            let is3 = &first[0..8] == ROOT3_MAGIC;
+            let cand: Option<Cand> = if is3 || &first[0..8] == ROOT_MAGIC {
+                let crc_end = if is3 { 72 } else { 40 };
+                let ok = u32::from_le_bytes(first[crc_end..crc_end + 4].try_into().unwrap()) == crc32(&first[0..crc_end]);
                 if !ok {
                     None
                 } else {
@@ -803,8 +1327,23 @@ impl<D: BlockDev> Store<D> {
                     let mstart = u64::from_le_bytes(first[16..24].try_into().unwrap());
                     let mlen = u32::from_le_bytes(first[24..28].try_into().unwrap()) as usize;
                     let mcrc = u32::from_le_bytes(first[28..32].try_into().unwrap());
+                    let rnext = u32::from_le_bytes(first[32..36].try_into().unwrap());
+                    let mstart2 = if is3 { u64::from_le_bytes(first[64..72].try_into().unwrap()) } else { 0 };
+                    let (ckpt_gen, log) = if is3 {
+                        (
+                            u64::from_le_bytes(first[40..48].try_into().unwrap()),
+                            (
+                                u64::from_le_bytes(first[48..56].try_into().unwrap()),
+                                u32::from_le_bytes(first[56..60].try_into().unwrap()) as u64,
+                                u32::from_le_bytes(first[60..64].try_into().unwrap()) as u64,
+                            ),
+                        )
+                    } else {
+                        (gen, (0, 0, 0))
+                    };
                     let nsect = sectors_for(mlen as u64);
-                    if mlen == 0 || mlen > MAX_META_BYTES || mstart < DATA_START || mstart.checked_add(nsect).map_or(true, |e| e > total) {
+                    let log_ok = log.2 <= log.1 && (log.1 == 0 || (log.0 >= DATA_START && log.0.checked_add(log.1).map_or(false, |e| e <= total)));
+                    if mlen == 0 || mlen > MAX_META_BYTES || mstart < DATA_START || mstart.checked_add(nsect).map_or(true, |e| e > total) || ckpt_gen > gen || !log_ok {
                         None
                     } else {
                         let mut buf = vec![0u8; nsect as usize * SECTOR];
@@ -812,13 +1351,34 @@ impl<D: BlockDev> Store<D> {
                             return Err((e.into(), dev));
                         }
                         buf.truncate(mlen);
+                        if crc32(&buf) != mcrc && mstart2 >= DATA_START && mstart2.checked_add(nsect).map_or(false, |e| e <= total) {
+                            // primary image damaged: use the mirror copy
+                            buf.resize(nsect as usize * SECTOR, 0);
+                            if let Err(e) = dev.read(mstart2, &mut buf) {
+                                return Err((e.into(), dev));
+                            }
+                            buf.truncate(mlen);
+                        }
                         if crc32(&buf) != mcrc {
                             None
                         } else {
-                            decode_meta(&buf, total).and_then(|(map, next)| {
-                                // the stored next-inode counter must agree with the image
-                                (u32::from_le_bytes(first[32..36].try_into().unwrap()) == next).then_some((gen, slot, map, next, (mstart, nsect)))
-                            })
+                            match decode_meta_raw(&buf, total) {
+                                Some((mut map, next)) if rnext == next => {
+                                    // the stored counter must agree with the image; then replay the commit log on top
+                                    let mut final_next = Some(next);
+                                    if log.2 > 0 {
+                                        let mut lb = vec![0u8; log.2 as usize * SECTOR];
+                                        if let Err(e) = dev.read(log.0, &mut lb) {
+                                            return Err((e.into(), dev));
+                                        }
+                                        final_next = replay_log(&mut map, &lb, ckpt_gen, gen, total, next);
+                                    } else if gen != ckpt_gen {
+                                        final_next = None;
+                                    }
+                                    final_next.and_then(|n| validate_tree(&map).then_some((gen, slot, map, n, (mstart, nsect), mstart2, (mlen as u32, mcrc, next, ckpt_gen), log)))
+                                }
+                                _ => None,
+                            }
                         }
                     }
                 }
@@ -830,7 +1390,7 @@ impl<D: BlockDev> Store<D> {
                 }
                 decode_dir_v1(&img, total).map(|(g, files)| {
                     let (map, next) = tree_from_v1(&files);
-                    (g, slot, map, next, (0, 0))
+                    (g, slot, map, next, (0, 0), 0, (0, 0, 0, 0), (0, 0, 0))
                 })
             } else {
                 None
@@ -842,13 +1402,17 @@ impl<D: BlockDev> Store<D> {
             }
         }
         match best {
-            Some((gen, cur_slot, inodes, next_ino, meta)) => Ok(Store { dev, total, gen, cur_slot, inodes, next_ino, meta }),
+            Some((gen, cur_slot, inodes, next_ino, meta, meta2, ck, log)) => {
+                let mut used = used_list(&inodes, meta, meta2, log);
+                let free = FreeMap::new(total, &mut used);
+                Ok(Store { dev, total, gen, cur_slot, inodes, next_ino, meta, ck, meta2, log, free, poisoned: false })
+            }
             None => Err((StoreErr::Corrupt, dev)),
         }
     }
 
     pub fn stats(&self) -> StoreStats {
-        let mut used = self.meta.1;
+        let mut used = self.meta.1 + if self.meta2 != 0 { self.meta.1 } else { 0 } + self.log.1;
         let (mut files, mut dirs) = (0, 0);
         for i in self.inodes.values() {
             match i.kind {
@@ -863,30 +1427,50 @@ impl<D: BlockDev> Store<D> {
         StoreStats { total_bytes: self.total * SECTOR as u64, data_bytes: (self.total - DATA_START) * SECTOR as u64, used_bytes: used * SECTOR as u64, files, dirs: dirs - 1, generation: self.gen }
     }
 
-    /// Extents referenced by the committed state (files + metadata image).
-    fn used_extents(&self) -> Vec<(u64, u64)> {
-        let mut u: Vec<(u64, u64)> = Vec::new();
-        for i in self.inodes.values() {
-            for &(s, n) in &i.extents {
-                u.push((s, s + n as u64));
-            }
-        }
-        if self.meta.1 > 0 {
-            u.push((self.meta.0, self.meta.0 + self.meta.1));
-        }
-        u
-    }
-
     fn check_writable(&self) -> Result<(), StoreErr> {
-        if self.dev.read_only() {
+        if self.dev.read_only() || self.poisoned {
             Err(StoreErr::Io(BlkErr::ReadOnly))
         } else {
             Ok(())
         }
     }
 
-    /// Commit the staged overlay as the next generation (see the module docs for the ordering).
-    fn commit(&mut self, ov: BTreeMap<u32, Option<Inode>>, next_ino: u32, pending: &[(u64, u32)]) -> Result<(), StoreErr> {
+    /// `(generation of the current checkpoint image, log sectors used, log capacity in sectors)`.
+    pub fn log_state(&self) -> (u64, u64, u64) {
+        (self.ck.3, self.log.2, self.log.1)
+    }
+
+    /// Free space in bytes (sectors not referenced by the committed tree).
+    pub fn free_bytes(&self) -> u64 {
+        self.free.free_sectors() * SECTOR as u64
+    }
+
+    /// Commit the staged overlay as the next generation (see the module docs for the ordering). `fresh` are the
+    /// extents this operation allocated: they go back to the free map if the commit fails before the root record.
+    fn commit(&mut self, ov: BTreeMap<u32, Option<Inode>>, next_ino: u32, fresh: &[(u64, u32)]) -> Result<(), StoreErr> {
+        match self.commit_inner(ov, next_ino) {
+            Ok(()) => Ok(()),
+            Err((e, started)) => {
+                if started {
+                    self.poisoned = true;
+                } else {
+                    self.free.give_ext(fresh);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn commit_inner(&mut self, ov: BTreeMap<u32, Option<Inode>>, next_ino: u32) -> Result<(), (StoreErr, bool)> {
+        // Fast path: append the changes to the commit log (one sector-aligned record + the root record) instead of
+        // rewriting the whole metadata image. A checkpoint (the full image) is made when the log is full.
+        if self.meta.1 > 0 && self.log.1 > 0 {
+            let payload = encode_delta(&ov, &self.inodes, next_ino);
+            let rs = sectors_for((LOG_HDR + payload.len()) as u64);
+            if payload.len() <= LOG_PAYLOAD_MAX && rs <= self.log.1 / 2 && self.log.2 + rs <= self.log.1 {
+                return self.commit_delta(ov, next_ino, payload, rs);
+            }
+        }
         let mut merged: Vec<(u32, &Inode)> = Vec::with_capacity(self.inodes.len() + ov.len());
         for (k, v) in &self.inodes {
             if !ov.contains_key(k) {
@@ -900,28 +1484,77 @@ impl<D: BlockDev> Store<D> {
         }
         merged.sort_by_key(|m| m.0);
         if merged.len() > MAX_FILES {
-            return Err(StoreErr::TooManyFiles);
+            return Err((StoreErr::TooManyFiles, false));
         }
-        let meta = encode_meta(&merged, next_ino);
+        let mut meta = encode_meta(&merged, next_ino);
+        drop(merged);
         if meta.len() > MAX_META_BYTES {
-            return Err(StoreErr::NoSpace);
+            return Err((StoreErr::NoSpace, false));
         }
-        let msect = sectors_for(meta.len() as u64);
-        let mut used = self.used_extents();
-        for &(s, n) in pending {
-            used.push((s, s + n as u64));
-        }
-        let mstart = alloc_extents(&used, self.total, msect, 1).ok_or(StoreErr::NoSpace)?[0].0;
-        let mut padded = meta.clone();
-        padded.resize(msect as usize * SECTOR, 0);
+        let mlen = meta.len();
+        let mcrc = crc32(&meta);
+        let msect = sectors_for(mlen as u64);
+        let mstart = self.free.take(msect, 1).ok_or((StoreErr::NoSpace, false))?[0].0;
+        // mirror copy of the image (if the disk is too full for it, the checkpoint is a single copy)
+        let mstart2 = self.free.take(msect, 1).map_or(0, |v| v[0].0);
+        // a fresh, empty commit log next to the new checkpoint (none if the disk is too full: then every commit is a checkpoint)
+        let want_log = (msect / 4).clamp(128, 8192);
+        let log = match self.free.take(want_log, 1) {
+            Some(v) => (v[0].0, want_log, 0u64),
+            None => (0, 0, 0),
+        };
+        meta.resize(msect as usize * SECTOR, 0);
         let new_gen = self.gen + 1;
         let slot = 1 - self.cur_slot;
-        self.dev.flush()?; // file data first
-        self.dev.write(mstart, &padded)?;
-        self.dev.flush()?; // then the metadata image
-        self.dev.write(1 + slot as u64 * DIR_SECTORS, &encode_root(new_gen, mstart, meta.len() as u32, crc32(&meta), next_ino))?;
-        self.dev.flush()?; // the root record commits
-        // apply the overlay to the in-memory state
+        let pre = (|| -> Result<(), StoreErr> {
+            self.dev.flush()?; // file data first
+            self.dev.write(mstart, &meta)?;
+            if mstart2 != 0 {
+                self.dev.write(mstart2, &meta)?;
+            }
+            self.dev.flush()?; // then the metadata image
+            Ok(())
+        })();
+        if let Err(e) = pre {
+            self.free.give(mstart, mstart + msect);
+            if mstart2 != 0 {
+                self.free.give(mstart2, mstart2 + msect);
+            }
+            if log.1 > 0 {
+                self.free.give(log.0, log.0 + log.1);
+            }
+            return Err((e, false));
+        }
+        let root = (|| -> Result<(), StoreErr> {
+            self.dev.write(1 + slot as u64 * DIR_SECTORS, &encode_root(new_gen, new_gen, mstart, mstart2, mlen as u32, mcrc, next_ino, log))?;
+            self.dev.flush()?; // the root record commits
+            Ok(())
+        })();
+        if let Err(e) = root {
+            return Err((e, true));
+        }
+        // the new root is durable: what the old tree referenced and the new one does not becomes free
+        let mut freed: Vec<(u64, u64)> = Vec::new();
+        for (k, v) in &ov {
+            if let Some(old) = self.inodes.get(k) {
+                if !old.extents.is_empty() {
+                    let new_ex: &[(u64, u32)] = match v {
+                        Some(i) => &i.extents,
+                        None => &[],
+                    };
+                    freed.extend(freed_ranges(&old.extents, new_ex));
+                }
+            }
+        }
+        if self.meta.1 > 0 {
+            freed.push((self.meta.0, self.meta.0 + self.meta.1));
+        }
+        if self.meta2 != 0 {
+            freed.push((self.meta2, self.meta2 + self.meta.1));
+        }
+        if self.log.1 > 0 {
+            freed.push((self.log.0, self.log.0 + self.log.1));
+        }
         for (k, v) in ov {
             match v {
                 Some(i) => {
@@ -932,29 +1565,156 @@ impl<D: BlockDev> Store<D> {
                 }
             }
         }
+        for (a, b) in freed {
+            self.free.give(a, b);
+        }
         self.next_ino = next_ino;
         self.gen = new_gen;
         self.cur_slot = slot;
         self.meta = (mstart, msect);
+        self.ck = (mlen as u32, mcrc, next_ino, new_gen);
+        self.meta2 = mstart2;
+        self.log = log;
         Ok(())
     }
 
-    /// Read all bytes of a file inode (extents, CRC verified).
+    /// Append one record to the commit log and commit it with a new root record (same checkpoint, longer log).
+    fn commit_delta(&mut self, ov: BTreeMap<u32, Option<Inode>>, next_ino: u32, payload: Vec<u8>, rs: u64) -> Result<(), (StoreErr, bool)> {
+        let new_gen = self.gen + 1;
+        let slot = 1 - self.cur_slot;
+        let mut rec = vec![0u8; rs as usize * SECTOR];
+        rec[0..4].copy_from_slice(&LOG_MAGIC.to_le_bytes());
+        rec[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        rec[8..12].copy_from_slice(&crc32(&payload).to_le_bytes());
+        rec[16..24].copy_from_slice(&new_gen.to_le_bytes());
+        rec[LOG_HDR..LOG_HDR + payload.len()].copy_from_slice(&payload);
+        let pre = (|| -> Result<(), StoreErr> {
+            self.dev.flush()?; // file data first
+            self.dev.write(self.log.0 + self.log.2, &rec)?;
+            self.dev.flush()?; // then the log record (beyond the committed end: the old root ignores it)
+            Ok(())
+        })();
+        if let Err(e) = pre {
+            return Err((e, false));
+        }
+        let new_log = (self.log.0, self.log.1, self.log.2 + rs);
+        let root = (|| -> Result<(), StoreErr> {
+            self.dev.write(1 + slot as u64 * DIR_SECTORS, &encode_root(new_gen, self.ck.3, self.meta.0, self.meta2, self.ck.0, self.ck.1, self.ck.2, new_log))?;
+            self.dev.flush()?;
+            Ok(())
+        })();
+        if let Err(e) = root {
+            return Err((e, true));
+        }
+        let mut freed: Vec<(u64, u64)> = Vec::new();
+        for (k, v) in &ov {
+            if let Some(old) = self.inodes.get(k) {
+                if !old.extents.is_empty() {
+                    let new_ex: &[(u64, u32)] = match v {
+                        Some(i) => &i.extents,
+                        None => &[],
+                    };
+                    freed.extend(freed_ranges(&old.extents, new_ex));
+                }
+            }
+        }
+        for (k, v) in ov {
+            match v {
+                Some(i) => {
+                    self.inodes.insert(k, i);
+                }
+                None => {
+                    self.inodes.remove(&k);
+                }
+            }
+        }
+        for (a, b) in freed {
+            self.free.give(a, b);
+        }
+        self.next_ino = next_ino;
+        self.gen = new_gen;
+        self.cur_slot = slot;
+        self.log = new_log;
+        Ok(())
+    }
+
+    /// Read all bytes of a file inode (CRC verified). Only for files up to `MAX_INMEM_BYTES`.
     fn read_inode(dev: &mut D, i: &Inode) -> Result<Vec<u8>, StoreErr> {
         if i.size == 0 {
             return Ok(Vec::new());
         }
-        let mut out: Vec<u8> = Vec::with_capacity(i.size as usize + SECTOR);
-        for &(s, n) in &i.extents {
-            let at = out.len();
-            out.resize(at + n as usize * SECTOR, 0);
-            dev.read(s, &mut out[at..])?;
+        if i.size > MAX_INMEM_BYTES as u64 {
+            return Err(StoreErr::TooLarge);
         }
+        let nsect = sectors_for(i.size);
+        let mut out = vec![0u8; nsect as usize * SECTOR];
+        read_sectors(dev, &i.extents, 0, nsect, &mut out)?;
         out.truncate(i.size as usize);
-        if crc32(&out) != i.crc {
-            return Err(StoreErr::Corrupt);
+        if i.chunks.is_empty() {
+            if crc32(&out) != i.crc {
+                return Err(StoreErr::Corrupt);
+            }
+        } else {
+            for (k, c) in out.chunks(CHUNK).enumerate() {
+                if crc32(c) != i.chunks[k] {
+                    return Err(StoreErr::Corrupt);
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Read `buf.len()` bytes at `off` (fewer at end of file), verifying the CRC of every 64 KiB chunk touched.
+    /// Whole chunks inside the range are read straight into `buf`; only the partial chunks at the ends use a temporary.
+    fn read_range(dev: &mut D, i: &Inode, off: u64, buf: &mut [u8]) -> Result<usize, StoreErr> {
+        if off >= i.size || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = (buf.len() as u64).min(i.size - off) as usize;
+        let buf = &mut buf[..n];
+        if i.chunks.is_empty() {
+            // legacy file (one whole-file CRC): verify it all, then slice
+            let all = Self::read_inode(dev, i)?;
+            buf.copy_from_slice(&all[off as usize..off as usize + n]);
+            return Ok(n);
+        }
+        let end = off + n as u64;
+        let full = |k: u64| (k + 1) * CHUNK_U <= i.size && (k + 1) * CHUNK_U <= end;
+        let mut pos = off;
+        let mut tmp: Vec<u8> = Vec::new();
+        while pos < end {
+            let c = pos / CHUNK_U;
+            let cstart = c * CHUNK_U;
+            if pos == cstart && full(c) {
+                let mut last = c;
+                while full(last + 1) {
+                    last += 1;
+                }
+                let bytes = ((last - c + 1) * CHUNK_U) as usize;
+                let dst = &mut buf[(pos - off) as usize..(pos - off) as usize + bytes];
+                read_sectors(dev, &i.extents, c * CHUNK_SECT, (last - c + 1) * CHUNK_SECT, dst)?;
+                for (k, piece) in dst.chunks(CHUNK).enumerate() {
+                    if crc32(piece) != i.chunks[(c as usize) + k] {
+                        return Err(StoreErr::Corrupt);
+                    }
+                }
+                pos += bytes as u64;
+            } else {
+                let valid = (cstart + CHUNK_U).min(i.size) - cstart;
+                let nsect = sectors_for(valid);
+                tmp.clear();
+                tmp.resize(nsect as usize * SECTOR, 0);
+                read_sectors(dev, &i.extents, c * CHUNK_SECT, nsect, &mut tmp)?;
+                if crc32(&tmp[..valid as usize]) != i.chunks[c as usize] {
+                    return Err(StoreErr::Corrupt);
+                }
+                let lo = pos - cstart;
+                let hi = (end - cstart).min(valid);
+                buf[(pos - off) as usize..(pos - off + hi - lo) as usize].copy_from_slice(&tmp[lo as usize..hi as usize]);
+                pos += hi - lo;
+            }
+        }
+        Ok(n)
     }
 
     // ------------------------------------------------------------ queries ---
@@ -1024,6 +1784,22 @@ impl<D: BlockDev> Store<D> {
         Self::read_inode(&mut self.dev, &inode)
     }
 
+    /// Read up to `buf.len()` bytes of a file at byte offset `off`; returns the number of bytes read (0 at or past
+    /// the end). Only the 64 KiB chunks that overlap the range are read and verified.
+    pub fn read_at(&mut self, path: &str, off: u64, buf: &mut [u8]) -> Result<usize, StoreErr> {
+        let ino = {
+            let tx = Tx::new(&self.inodes, self.next_ino);
+            walk(&tx, path, true)?
+        };
+        let i = self.inodes.get(&ino).ok_or(StoreErr::Corrupt)?;
+        match i.kind {
+            Kind::Dir => return Err(StoreErr::IsDir),
+            Kind::Symlink => return Err(StoreErr::Invalid),
+            Kind::File => {}
+        }
+        Self::read_range(&mut self.dev, i, off, buf)
+    }
+
     /// Files directly in the root directory (the flat v1 view).
     pub fn list(&self) -> Vec<Entry> {
         let Some(root) = self.inodes.get(&ROOT) else { return Vec::new() };
@@ -1041,10 +1817,10 @@ impl<D: BlockDev> Store<D> {
     // ------------------------------------------------------------ mutations ---
 
     /// Create or atomically replace the file `path` (the parent directory must exist). Mode and ownership of an
-    /// existing file are kept.
+    /// existing file are kept. At most `MAX_INMEM_BYTES`; bigger files are built with `write_at`.
     pub fn write(&mut self, path: &str, data: &[u8]) -> Result<(), StoreErr> {
         self.check_writable()?;
-        if data.len() > MAX_FILE_BYTES {
+        if data.len() > MAX_INMEM_BYTES {
             return Err(StoreErr::TooLarge);
         }
         let now = now_secs();
@@ -1065,26 +1841,28 @@ impl<D: BlockDev> Store<D> {
         if existing.is_none() && tx.get(parent).ok_or(StoreErr::Corrupt)?.entries.contains_key(&name) {
             return Err(StoreErr::NotFound); // a dangling symlink: creating through it is not supported
         }
-        // data goes to free extents of the committed state
+        // data goes straight from the caller's buffer to free extents of the committed state
         let nsect = sectors_for(data.len() as u64);
-        let used = self.used_extents();
-        let extents = alloc_extents(&used, self.total, nsect, MAX_EXTENTS).ok_or(StoreErr::NoSpace)?;
-        let mut off = 0usize;
-        for &(s, n) in &extents {
-            let len = n as usize * SECTOR;
-            let end = (off + len).min(data.len());
-            let mut chunk = data[off..end].to_vec();
-            chunk.resize(len, 0);
-            self.dev.write(s, &chunk)?;
-            off += len;
+        let extents = self.free.take(nsect, ALLOC_FRAGS).ok_or(StoreErr::NoSpace)?;
+        if let Err(e) = write_data(&mut self.dev, &extents, data) {
+            self.free.give_ext(&extents);
+            return Err(e);
         }
+        let chunks = chunk_crcs(data);
+        let crc = table_crc(&chunks);
         match existing {
             Some((ino, mode)) => {
-                tx.put(ino, Inode::file(mode, now, data.len() as u64, crc32(data), extents.clone()));
+                tx.put(ino, Inode::file(mode, now, data.len() as u64, crc, extents.clone(), chunks));
             }
             None => {
-                let ino = tx.fresh()?;
-                tx.put(ino, Inode::file(0o644, now, data.len() as u64, crc32(data), extents.clone()));
+                let ino = match tx.fresh() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.free.give_ext(&extents);
+                        return Err(e);
+                    }
+                };
+                tx.put(ino, Inode::file(0o644, now, data.len() as u64, crc, extents.clone(), chunks));
                 let mut p = tx.get(parent).ok_or(StoreErr::Corrupt)?.clone();
                 p.entries.insert(name, ino);
                 p.mtime = now;
@@ -1093,6 +1871,128 @@ impl<D: BlockDev> Store<D> {
         }
         let (ov, nx) = tx.finish();
         self.commit(ov, nx, &extents)
+    }
+
+    /// Write `data` at byte offset `off` (creating the file if it does not exist; a gap past the end reads as
+    /// zeros). Copy-on-write at 64 KiB chunk granularity: only the chunks the range touches are rewritten into
+    /// free space, the rest of the file is not read or written. One atomic commit.
+    pub fn write_at(&mut self, path: &str, off: u64, data: &[u8]) -> Result<(), StoreErr> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.modify(path, off, data, None)
+    }
+
+    /// Set the size of an existing file (shrinking frees the tail; growing zero-fills).
+    pub fn truncate(&mut self, path: &str, len: u64) -> Result<(), StoreErr> {
+        self.modify(path, 0, &[], Some(len))
+    }
+
+    fn modify(&mut self, path: &str, off: u64, data: &[u8], set_len: Option<u64>) -> Result<(), StoreErr> {
+        self.check_writable()?;
+        let end = off.checked_add(data.len() as u64).ok_or(StoreErr::TooLarge)?;
+        if end > MAX_FILE_BYTES as u64 || set_len.map_or(false, |l| l > MAX_FILE_BYTES as u64) {
+            return Err(StoreErr::TooLarge);
+        }
+        let lookup = |inodes: &BTreeMap<u32, Inode>, next: u32| {
+            let tx = Tx::new(inodes, next);
+            walk(&tx, path, true)
+        };
+        let ino = match lookup(&self.inodes, self.next_ino) {
+            Ok(n) => n,
+            Err(StoreErr::NotFound) if set_len.is_none() => {
+                self.write(path, &[])?;
+                lookup(&self.inodes, self.next_ino)?
+            }
+            Err(e) => return Err(e),
+        };
+        let (mode, osize, oext, mut ochunks, legacy) = {
+            let i = self.inodes.get(&ino).ok_or(StoreErr::Corrupt)?;
+            match i.kind {
+                Kind::Dir => return Err(StoreErr::IsDir),
+                Kind::Symlink => return Err(StoreErr::Invalid),
+                Kind::File => {}
+            }
+            (i.mode, i.size, i.extents.clone(), i.chunks.clone(), i.chunks.is_empty() && i.size > 0)
+        };
+        if legacy {
+            // a v2 file has one whole-file CRC: verify it once and derive the chunk table
+            let i = self.inodes.get(&ino).ok_or(StoreErr::Corrupt)?;
+            let all = Self::read_inode(&mut self.dev, i)?;
+            ochunks = chunk_crcs(&all);
+        }
+        let now = now_secs();
+        let new_size = match set_len {
+            Some(l) => l,
+            None => osize.max(end),
+        };
+        let mut ov: BTreeMap<u32, Option<Inode>> = BTreeMap::new();
+
+        if new_size < osize {
+            // ---- shrink: keep a prefix of the extents; only the new last chunk's CRC changes
+            let keep = sectors_for(new_size);
+            let (left, _) = split_extents(&oext, keep);
+            ochunks.truncate(new_size.div_ceil(CHUNK_U) as usize);
+            if new_size % CHUNK_U != 0 {
+                let c = new_size / CHUNK_U;
+                let cstart = c * CHUNK_U;
+                let old_valid = (cstart + CHUNK_U).min(osize) - cstart;
+                let nsect = sectors_for(old_valid);
+                let mut tmp = vec![0u8; nsect as usize * SECTOR];
+                let old_crc = {
+                    let i = self.inodes.get(&ino).ok_or(StoreErr::Corrupt)?;
+                    if i.chunks.is_empty() { None } else { Some(i.chunks[c as usize]) }
+                };
+                read_sectors(&mut self.dev, &oext, c * CHUNK_SECT, nsect, &mut tmp)?;
+                if let Some(oc) = old_crc {
+                    if crc32(&tmp[..old_valid as usize]) != oc {
+                        return Err(StoreErr::Corrupt);
+                    }
+                }
+                ochunks[c as usize] = crc32(&tmp[..(new_size - cstart) as usize]);
+            }
+            let tc = table_crc(&ochunks);
+            ov.insert(ino, Some(Inode::file(mode, now, new_size, tc, merge_adjacent(left), ochunks)));
+            return self.commit(ov, self.next_ino, &[]);
+        }
+
+        // ---- grow / overwrite: [wlo, whi) is the byte range that has to be materialised
+        let (wlo, whi) = if data.is_empty() { (osize, new_size) } else { (off.min(osize), end) };
+        if whi <= wlo {
+            return Ok(());
+        }
+        let c0 = wlo / CHUNK_U;
+        let c1 = (whi - 1) / CHUNK_U;
+        let reg_start = c0 * CHUNK_U;
+        let reg_end = ((c1 + 1) * CHUNK_U).min(new_size);
+        let nsec = sectors_for(reg_end - reg_start);
+        let new_ex = self.free.take(nsec, ALLOC_FRAGS).ok_or(StoreErr::NoSpace)?;
+        let crcs = match build_region(&mut self.dev, &oext, &ochunks, osize, &new_ex, c0, c1, new_size, off, data) {
+            Ok(c) => c,
+            Err(e) => {
+                self.free.give_ext(&new_ex);
+                return Err(e);
+            }
+        };
+        let (left, rest) = split_extents(&oext, c0 * CHUNK_SECT);
+        let (_, right) = split_extents(&rest, (c1 + 1 - c0) * CHUNK_SECT);
+        let mut all = left;
+        all.extend_from_slice(&new_ex);
+        all.extend(right);
+        let extents = merge_adjacent(all);
+        let mut chunks: Vec<u32> = ochunks[..(c0 as usize).min(ochunks.len())].to_vec();
+        chunks.extend_from_slice(&crcs);
+        if ((c1 + 1) as usize) < ochunks.len() {
+            chunks.extend_from_slice(&ochunks[(c1 + 1) as usize..]);
+        }
+        let total_sect: u64 = extents.iter().map(|e| e.1 as u64).sum();
+        if extents.len() > MAX_EXTENTS || total_sect != sectors_for(new_size) || chunks.len() as u64 != new_size.div_ceil(CHUNK_U) {
+            self.free.give_ext(&new_ex);
+            return Err(if extents.len() > MAX_EXTENTS { StoreErr::NoSpace } else { StoreErr::Corrupt });
+        }
+        let tc = table_crc(&chunks);
+        ov.insert(ino, Some(Inode::file(mode, now, new_size, tc, extents, chunks)));
+        self.commit(ov, self.next_ino, &new_ex)
     }
 
     pub fn mkdir(&mut self, path: &str) -> Result<(), StoreErr> {

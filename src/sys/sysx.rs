@@ -39,6 +39,14 @@ pub const SYS_STORE_WRITE: u64 = 35;
 pub const SYS_STORE_CTL: u64 = 36;
 pub const SYS_PERM: u64 = 37;
 pub const SYS_STORE_FS: u64 = 38;
+/// proc_signal(proc cap, sig): signal a spawned Linux program's process group (SIGCONT/SIGTERM/SIGKILL...).
+pub const SYS_PROC_SIGNAL: u64 = 39;
+/// tty_fg(tty cap, proc cap or 0): the group of that child owns the terminal (Ctrl-C/Ctrl-Z go to it); 0 = the shell.
+pub const SYS_TTY_FG: u64 = 40;
+/// proc_spawn_io(spawn cap, file cap, args, args_len, io spec, io_len): like SYS_PROC_SPAWN, with redirections/pipes/group.
+pub const SYS_PROC_SPAWN_IO: u64 = 41;
+/// pipe_drop(id): discard the unclaimed end of a shell pipeline pipe.
+pub const SYS_PIPE_DROP: u64 = 42;
 
 pub const ENOEXEC: i64 = 8;
 const MAX_ARGS_BYTES: usize = 512;
@@ -54,7 +62,14 @@ pub fn handle(nr: u64, f: &SyscallFrame) -> i64 {
         SYS_FS_OPEN => fs_open(a0, a1, a2 as usize),
         SYS_FILE_READ => file_read(a0, a1, a2, a3 as usize),
         SYS_PROC_SPAWN => proc_spawn(a0, a1, a2, a3 as usize, a4, a5 as usize),
-        SYS_PROC_WAIT => proc_wait(a0, a1),
+        SYS_PROC_WAIT => proc_wait(a0, a1, a2),
+        SYS_PROC_SIGNAL => proc_signal(a0, a1),
+        SYS_TTY_FG => tty_fg(a0, a1),
+        SYS_PROC_SPAWN_IO => proc_spawn_io(a0, a1, a2, a3 as usize, a4, a5 as usize),
+        SYS_PIPE_DROP => {
+            pipe_drop(a0 as u32);
+            0
+        }
         SYS_PROC_LIST => proc_list(a0, a1, a2),
         SYS_CAP_LIST => cap_list(a0, a1),
         SYS_NET_GRANT => net_grant(a0, a1, a2, a3, a4),
@@ -198,7 +213,187 @@ fn put_err(p: &task::Process, buf: u64, max: usize, msg: &str) {
     }
 }
 
+// ---- shell pipelines: stdio redirection ----------------------------------------------------------------------------------
+// The shell names pipes with small ids. The first stage that mentions an id creates the pipe and parks the other end in
+// PIPE_TABLE; the stage at the other end claims it. `pipe_drop` discards a parked end when a pipeline fails to start (a
+// parked write end would otherwise keep a reader from ever seeing EOF).
+static PIPE_TABLE: crate::sync::IrqMutex<Vec<(u32, Option<crate::abi::vfs::OpenFile>, Option<crate::abi::vfs::OpenFile>)>> = crate::sync::IrqMutex::new(Vec::new());
+
+fn pipe_end(id: u32, want_write: bool) -> Result<crate::abi::vfs::OpenFile, i64> {
+    let mut t = PIPE_TABLE.lock();
+    if let Some(i) = t.iter().position(|e| e.0 == id) {
+        let slot = if want_write { t[i].2.take() } else { t[i].1.take() };
+        let Some(f) = slot else { return Err(EINVAL) }; // the same end asked for twice
+        if t[i].1.is_none() && t[i].2.is_none() {
+            t.remove(i);
+        }
+        return Ok(f);
+    }
+    if t.len() >= 32 {
+        return Err(EINVAL);
+    }
+    let (r, w) = crate::abi::vfs::new_pipe();
+    if want_write {
+        t.push((id, Some(r), None));
+        Ok(w)
+    } else {
+        t.push((id, None, Some(w)));
+        Ok(r)
+    }
+}
+
+fn pipe_drop(id: u32) {
+    let mut t = PIPE_TABLE.lock();
+    t.retain(|e| e.0 != id);
+}
+
+enum Stream {
+    Console,
+    FileRead(String),
+    FileWrite(String, bool),
+    PipeRead(u32),
+    PipeWrite(u32),
+    DupOut,
+}
+
+struct IoSpec {
+    group_of: Option<alloc::sync::Arc<crate::task::Process>>,
+    s: [Stream; 3],
+}
+
+/// io spec: [version=1][flags: 1 = join the process group of the proc cap given next][u64 proc cap] then three stream records
+/// (stdin, stdout, stderr): kind 0 console | 1 file read | 2 file write | 3 file append (u16 len + path) | 4 pipe read |
+/// 5 pipe write (u32 id) | 6 same as stdout (stderr only).
+fn parse_io(spec: &[u8]) -> Result<IoSpec, i64> {
+    let mut i = 0usize;
+    let rd = |i: &mut usize, n: usize| -> Result<&[u8], i64> {
+        if *i + n > spec.len() {
+            return Err(EINVAL);
+        }
+        let s = &spec[*i..*i + n];
+        *i += n;
+        Ok(s)
+    };
+    if rd(&mut i, 1)?[0] != 1 {
+        return Err(EINVAL);
+    }
+    let flags = rd(&mut i, 1)?[0];
+    let h = u64::from_le_bytes(rd(&mut i, 8)?.try_into().unwrap());
+    let group_of = if flags & 1 != 0 {
+        match lookup(h, Rights::READ) {
+            Ok(CapObject::Proc(c)) => Some(c),
+            Ok(_) => return Err(EINVAL),
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let mut streams: Vec<Stream> = Vec::new();
+    for n in 0..3 {
+        let kind = rd(&mut i, 1)?[0];
+        let st = match kind {
+            0 => Stream::Console,
+            1 | 2 | 3 => {
+                let l = u16::from_le_bytes(rd(&mut i, 2)?.try_into().unwrap()) as usize;
+                if l == 0 || l > 200 {
+                    return Err(EINVAL);
+                }
+                let path = core::str::from_utf8(rd(&mut i, l)?).map_err(|_| EINVAL)?;
+                let path = path.trim_start_matches('/');
+                if path.is_empty() || path.contains("..") {
+                    return Err(EINVAL);
+                }
+                match kind {
+                    1 => Stream::FileRead(String::from(path)),
+                    2 => Stream::FileWrite(String::from(path), false),
+                    _ => Stream::FileWrite(String::from(path), true),
+                }
+            }
+            4 => Stream::PipeRead(u32::from_le_bytes(rd(&mut i, 4)?.try_into().unwrap())),
+            5 => Stream::PipeWrite(u32::from_le_bytes(rd(&mut i, 4)?.try_into().unwrap())),
+            6 if n == 2 => Stream::DupOut,
+            _ => return Err(EINVAL),
+        };
+        streams.push(st);
+    }
+    let s2 = streams.pop().unwrap();
+    let s1 = streams.pop().unwrap();
+    let s0 = streams.pop().unwrap();
+    Ok(IoSpec { group_of, s: [s0, s1, s2] })
+}
+
+fn read_redirect_source(path: &str) -> Result<Vec<u8>, i64> {
+    if path.starts_with("tmp/") {
+        return crate::fs::tmpfs::read(path).ok_or(2); // ENOENT
+    }
+    let rel = path.strip_prefix("store/").unwrap_or(path);
+    match crate::store::with(|s| s.read(rel)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.errno()),
+        Err(_) => Err(2),
+    }
+}
+
+fn apply_io(child: &alloc::sync::Arc<crate::task::Process>, io: &IoSpec) -> Result<(), i64> {
+    use crate::abi::vfs::{self, Data, OpenFile};
+    let mut slots: [Option<usize>; 3] = [None; 3];
+    for n in 0..3 {
+        let f: OpenFile = match &io.s[n] {
+            Stream::Console => continue,
+            Stream::DupOut => {
+                slots[2] = slots[1];
+                continue;
+            }
+            Stream::FileRead(path) | Stream::FileWrite(path, _) if path == "dev/null" => {
+                OpenFile { name: path.clone(), data: Data::Null, pos: 0, writable: true, dirty: false, eof: false }
+            }
+            Stream::FileRead(path) => {
+                let data = read_redirect_source(path)?;
+                OpenFile { name: path.clone(), data: Data::Buf(data), pos: 0, writable: false, dirty: false, eof: false }
+            }
+            Stream::FileWrite(path, append) => {
+                let init = if *append { read_redirect_source(path).unwrap_or_default() } else { Vec::new() };
+                let pos = init.len();
+                OpenFile { name: path.clone(), data: Data::Buf(init), pos, writable: true, dirty: true, eof: false }
+            }
+            Stream::PipeRead(id) => pipe_end(*id, false)?,
+            Stream::PipeWrite(id) => pipe_end(*id, true)?,
+        };
+        slots[n] = Some(vfs::alloc(child, f)?);
+    }
+    let mut g = child.foreign.lock();
+    g.redirect = slots;
+    if let Some(leader) = &io.group_of {
+        drop(g);
+        let (pg, sd) = (crate::abi::signals::pgid_of(leader), crate::abi::signals::sid_of(leader));
+        let mut g = child.foreign.lock();
+        g.pgid = pg;
+        g.sid = sd;
+    }
+    Ok(())
+}
+
 fn proc_spawn(spawn_h: u64, file_h: u64, args_ptr: u64, args_len: usize, errbuf: u64, errmax: usize) -> i64 {
+    spawn_common(spawn_h, file_h, args_ptr, args_len, None, errbuf, errmax)
+}
+
+fn proc_spawn_io(spawn_h: u64, file_h: u64, args_ptr: u64, args_len: usize, io_ptr: u64, io_len: usize) -> i64 {
+    let p = task::current_process();
+    if io_len == 0 || io_len > 512 {
+        return -EINVAL;
+    }
+    let raw = match user_bytes(&p, io_ptr, io_len, 512) {
+        Ok(v) => v,
+        Err(e) => return -e,
+    };
+    let io = match parse_io(&raw) {
+        Ok(v) => v,
+        Err(e) => return -e,
+    };
+    spawn_common(spawn_h, file_h, args_ptr, args_len, Some(io), 0, 0)
+}
+
+fn spawn_common(spawn_h: u64, file_h: u64, args_ptr: u64, args_len: usize, io: Option<IoSpec>, errbuf: u64, errmax: usize) -> i64 {
     let p = task::current_process();
     let (console, files) = match lookup(spawn_h, Rights::EXEC) {
         Ok(CapObject::Spawn { console, files }) => (console, files),
@@ -237,7 +432,14 @@ fn proc_spawn(spawn_h: u64, file_h: u64, args_ptr: u64, args_len: usize, errbuf:
         }
         fcaps.push((CapObject::Store, Rights::READ | Rights::WRITE));
     }
-    match crate::exec::spawn(&fname, (*fdata).as_ref(), &crate::exec::SpawnOpts { args: &args, console, caps, foreign_caps: &fcaps }) {
+    let opts = crate::exec::SpawnOpts { args: &args, console, caps, foreign_caps: &fcaps };
+    let spawned = crate::exec::spawn_hooked(&fname, (*fdata).as_ref(), &opts, |child| match &io {
+        // only foreign (Linux) programs have a descriptor table that can be rewired
+        Some(io) if child.abi() == crate::abi::AbiKind::Linux => apply_io(child, io).map_err(|_| crate::exec::ExecError::OutOfMemory),
+        Some(_) => Err(crate::exec::ExecError::OutOfMemory),
+        None => Ok(()),
+    });
+    match spawned {
         Ok(child) => {
             let r = p.caps.lock().insert(CapObject::Proc(child), Rights::READ);
             match r {
@@ -252,18 +454,78 @@ fn proc_spawn(spawn_h: u64, file_h: u64, args_ptr: u64, args_len: usize, errbuf:
     }
 }
 
-fn proc_wait(h: u64, out: u64) -> i64 {
+/// flags: 1 = do not block (returns 1 while the child runs), 2 = also return when the child stops (returns 2 and stores
+/// the stop signal; each stop is reported once). Returns 0 when it exited (exit code stored at `out`).
+fn proc_wait(h: u64, out: u64, flags: u64) -> i64 {
     let child = match lookup(h, Rights::READ) {
         Ok(CapObject::Proc(c)) => c,
         Ok(_) => return -EINVAL,
         Err(e) => return -e,
     };
-    while !child.has_exited() {
+    loop {
+        if child.has_exited() {
+            let code = child.exit_code.load(Ordering::SeqCst);
+            return match uaccess::copy_to_user(&task::current_process(), out, &code.to_le_bytes()) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            };
+        }
+        if flags & 2 != 0 {
+            let sig = {
+                let mut g = child.foreign.lock();
+                if g.stopped && !g.stop_reported {
+                    g.stop_reported = true;
+                    Some(g.stop_sig as i64)
+                } else {
+                    None
+                }
+            };
+            if let Some(s) = sig {
+                return match uaccess::copy_to_user(&task::current_process(), out, &s.to_le_bytes()) {
+                    Ok(()) => 2,
+                    Err(e) => -e,
+                };
+            }
+        }
+        if flags & 1 != 0 {
+            return 1;
+        }
         task::sleep_ms(2);
     }
-    let code = child.exit_code.load(Ordering::SeqCst);
-    match uaccess::copy_to_user(&task::current_process(), out, &code.to_le_bytes()) {
-        Ok(()) => 0,
+}
+
+fn proc_signal(h: u64, sig: u64) -> i64 {
+    let child = match lookup(h, Rights::READ) {
+        Ok(CapObject::Proc(c)) => c,
+        Ok(_) => return -EINVAL,
+        Err(e) => return -e,
+    };
+    if sig == 0 || sig > 64 || child.has_exited() {
+        return -EINVAL;
+    }
+    if child.abi() != crate::abi::AbiKind::Linux {
+        return -EINVAL; // only Linux programs have signals
+    }
+    let pg = crate::abi::signals::pgid_of(&child);
+    if crate::abi::signals::signal_group(pg, sig) == 0 { -EINVAL } else { 0 }
+}
+
+fn tty_fg(tty: u64, proc_h: u64) -> i64 {
+    match lookup(tty, Rights::WRITE) {
+        Ok(CapObject::Tty) => {}
+        Ok(_) => return -EINVAL,
+        Err(e) => return -e,
+    }
+    if proc_h == 0 {
+        crate::tty::set_foreground(0);
+        return 0;
+    }
+    match lookup(proc_h, Rights::READ) {
+        Ok(CapObject::Proc(c)) => {
+            crate::tty::set_foreground(crate::abi::signals::pgid_of(&c));
+            0
+        }
+        Ok(_) => -EINVAL,
         Err(e) => -e,
     }
 }
@@ -510,7 +772,7 @@ fn store_write(h: u64, name: u64, len: usize, data: u64, dlen: usize) -> i64 {
     if kernel_reserved(&n) {
         return -EPERM;
     }
-    let bytes = match user_bytes(&p, data, dlen, crate::store::MAX_FILE_BYTES) {
+    let bytes = match user_bytes(&p, data, dlen, crate::store::MAX_INMEM_BYTES) {
         Ok(v) => v,
         Err(_) => return -EFBIG,
     };
@@ -545,9 +807,12 @@ fn guarded(path: &str, destructive: bool) -> bool {
 /// 2 mkdir W | 3 rmdir W | 4 unlink W | 5 rename W (a4/a5 = destination ptr/len) | 6 symlink W (a4/a5 = target ptr/len)
 /// 7 readlink(path) -> bytes at a4 (capacity a5), returns length | 8 chmod W (a4 = mode)
 /// 9 read(path) -> bytes at a4 (capacity a5), returns the file size (larger than a5 means "truncated, retry bigger")
-/// 10 write W (a4/a5 = data ptr/len): create or atomically replace.
+/// 10 write W (a4/a5 = data ptr/len): create or atomically replace (<= 32 MiB).
+/// 11 read_at(path, a4 = ptr to {off u64, buf u64, len u64}) -> bytes read (<= 4 MiB per call, 0 at end of file)
+/// 12 write_at W (same record, `buf`/`len` = data, <= 4 MiB per call): copy-on-write at 64 KiB chunks, creates the file
+/// 13 truncate W (a4 = new size): shrink or zero-extend an existing file
 fn store_fs(h: u64, op: u64, path: u64, plen: usize, a4: u64, a5: u64) -> i64 {
-    let need = if matches!(op, 0 | 1 | 7 | 9) { Rights::READ } else { Rights::WRITE };
+    let need = if matches!(op, 0 | 1 | 7 | 9 | 11) { Rights::READ } else { Rights::WRITE };
     if let Err(e) = need_store(h, need) {
         return -e;
     }
@@ -556,7 +821,7 @@ fn store_fs(h: u64, op: u64, path: u64, plen: usize, a4: u64, a5: u64) -> i64 {
         Ok(s) => s,
         Err(e) => return -e,
     };
-    if need == Rights::WRITE && guarded(&path, op != 10 && op != 8) {
+    if need == Rights::WRITE && guarded(&path, op != 10 && op != 8 && op != 12) {
         return -EPERM;
     }
     macro_rules! st {
@@ -660,11 +925,44 @@ fn store_fs(h: u64, op: u64, path: u64, plen: usize, a4: u64, a5: u64) -> i64 {
             return d.len() as i64;
         }
         10 => {
-            let bytes = match user_bytes(&p, a4, a5 as usize, crate::store::MAX_FILE_BYTES) {
+            let bytes = match user_bytes(&p, a4, a5 as usize, crate::store::MAX_INMEM_BYTES) {
                 Ok(v) => v,
                 Err(_) => return -EFBIG,
             };
             st!(|s| s.write(&path, &bytes));
+            0
+        }
+        11 | 12 => {
+            const IO_MAX: usize = 4 * 1024 * 1024;
+            let rec = match user_bytes(&p, a4, 24, 24) {
+                Ok(v) if v.len() == 24 => v,
+                Ok(_) => return -EINVAL,
+                Err(e) => return -e,
+            };
+            let off = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+            let buf = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+            let len = u64::from_le_bytes(rec[16..24].try_into().unwrap()) as usize;
+            if len > IO_MAX {
+                return -EINVAL;
+            }
+            if op == 11 {
+                let mut tmp = alloc::vec![0u8; len];
+                let n = st!(|s| s.read_at(&path, off, &mut tmp));
+                let r = out(buf, &tmp[..n]);
+                if r < 0 {
+                    return r;
+                }
+                return n as i64;
+            }
+            let bytes = match user_bytes(&p, buf, len, IO_MAX) {
+                Ok(v) => v,
+                Err(e) => return -e,
+            };
+            st!(|s| s.write_at(&path, off, &bytes));
+            len as i64
+        }
+        13 => {
+            st!(|s| s.truncate(&path, a4));
             0
         }
         _ => -EINVAL,

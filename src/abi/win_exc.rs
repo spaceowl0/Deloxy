@@ -32,6 +32,8 @@ const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 const STATUS_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
 const NONCONTINUABLE: u32 = 1;
+/// RFLAGS bits a program may set: CF PF AF ZF SF TF DF OF AC (never IOPL, NT, VM, IF-off ...)
+pub const FLAGS_USER: u64 = 0x8D5 | 0x100 | 0x400 | 0x40000;
 const KIND_SOFT: u64 = 1;
 const FLAG_FILTER: u64 = 2;
 
@@ -226,7 +228,7 @@ fn tf_from_context(c: &[u8]) -> Option<TrapFrame> {
         r15: get(c, 0xF0), r14: get(c, 0xE8), r13: get(c, 0xE0), r12: get(c, 0xD8), r11: get(c, 0xD0), r10: get(c, 0xC8),
         r9: get(c, 0xC0), r8: get(c, 0xB8), rbp: get(c, 0xA0), rdi: get(c, 0xB0), rsi: get(c, 0xA8), rdx: get(c, 0x88),
         rcx: get(c, 0x80), rbx: get(c, 0x90), rax: get(c, 0x78), vector: 0, error: 0, rip, cs,
-        rflags: (eflags & 0x8D5) | 0x202, rsp, ss,
+        rflags: (eflags & FLAGS_USER) | 0x202, rsp, ss,
     })
 }
 
@@ -278,15 +280,25 @@ fn begin(p: &Arc<Process>, tf: &mut TrapFrame, code: u32, flags: u32, addr: u64,
     tf.rsp = x;
     tf.rip = target;
     tf.rcx = ptrs;
-    tf.rflags = (tf.rflags & !0x400) | 0x200;
+    // the handler never single-steps or runs with alignment checking (its CONTEXT keeps both for the resume)
+    tf.rflags = (tf.rflags & !(0x400 | 0x100 | 0x40000)) | 0x200;
     true
 }
 
 /// A CPU fault in a PE process. `true` = `tf` now runs a handler.
-pub fn deliver_fault(p: &Arc<Process>, tf: &mut TrapFrame, cr2: u64, exit: i64) -> bool {
+pub fn deliver_fault(p: &Arc<Process>, tf: &mut TrapFrame, cr2: u64, exit: i64, fpe_err: u16) -> bool {
     let (code, params): (u32, Vec<u64>) = match tf.vector {
         0 => (STATUS_INT_DIVIDE_BY_ZERO, Vec::new()),
+        1 => (0x8000_0004, Vec::new()),                       // EXCEPTION_SINGLE_STEP
+        3 => (0x8000_0003, alloc::vec![0]),                   // EXCEPTION_BREAKPOINT
         6 => (STATUS_ILLEGAL_INSTRUCTION, Vec::new()),
+        11 | 12 => (0xC000_0005, alloc::vec![0, 0]),          // no segments in user mode: report as an access violation
+        16 | 19 => (
+            // STATUS_FLOAT_*: invalid 0x90, divide-by-zero 0x8E, overflow 0x91, underflow 0x93, inexact 0x8F, denormal 0x8D
+            if fpe_err & 0x01 != 0 { 0xC000_0090 } else if fpe_err & 0x04 != 0 { 0xC000_008E } else if fpe_err & 0x08 != 0 { 0xC000_0091 } else if fpe_err & 0x10 != 0 { 0xC000_0093 } else if fpe_err & 0x20 != 0 { 0xC000_008F } else if fpe_err & 0x02 != 0 { 0xC000_008D } else { 0xC000_0090 },
+            Vec::new(),
+        ),
+        17 => (0x8000_0002, Vec::new()),                       // EXCEPTION_DATATYPE_MISALIGNMENT
         13 => (STATUS_ACCESS_VIOLATION, alloc::vec![0, 0]),
         _ => {
             let kind = if tf.error & 0x10 != 0 { 8 } else if tf.error & 2 != 0 { 1 } else { 0 };
@@ -294,7 +306,9 @@ pub fn deliver_fault(p: &Arc<Process>, tf: &mut TrapFrame, cr2: u64, exit: i64) 
         }
     };
     let rip = tf.rip;
-    begin(p, tf, code, 0, rip, &params, 0, exit as u64)
+    // a breakpoint reports the address of the int3 itself; the context already points after it (continuing runs on)
+    let addr = if tf.vector == 3 { rip.wrapping_sub(1) } else { rip };
+    begin(p, tf, code, 0, addr, &params, 0, exit as u64)
 }
 
 /// `RaiseException(code, flags, nargs, args*)`: never returns when a handler was started.
@@ -383,7 +397,7 @@ pub fn exc_return(p: &Arc<Process>, f: &mut SyscallFrame, res: u64) {
     tf.rsp = x;
     tf.rip = target;
     tf.rcx = hdr + HDR_LEN;
-    tf.rflags = (tf.rflags & !0x400) | 0x202;
+    tf.rflags = (tf.rflags & !(0x400 | 0x100 | 0x40000)) | 0x202;
     // SAFETY: x and target are user addresses (target was validated at registration).
     unsafe { crate::arch::x86_64::idt::iret_trapframe(&tf) }
 }

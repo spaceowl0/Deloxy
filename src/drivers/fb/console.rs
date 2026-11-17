@@ -19,6 +19,8 @@ struct Console {
     esc: u8,      // 0 none, 1 saw ESC, 2 inside CSI
     param: u16,   // current numeric parameter
     enabled: bool,
+    /// rows (pixel y range) drawn since the last flush to a virtio-gpu
+    dirty: Option<(usize, usize)>,
 }
 
 static CONSOLE: IrqMutex<Console> = IrqMutex::new(Console {
@@ -31,6 +33,7 @@ static CONSOLE: IrqMutex<Console> = IrqMutex::new(Console {
     esc: 0,
     param: 0,
     enabled: false,
+    dirty: None,
 });
 
 pub fn init() {
@@ -39,6 +42,9 @@ pub fn init() {
     c.cols = fb.width / GLYPH_W;
     c.rows = fb.height / GLYPH_H;
     c.fb = Some(fb);
+    c.col = 0;
+    c.row = 0;
+    c.dirty = None;
     // SAFETY: the rectangle is exactly the screen.
     unsafe { fb.fill(0, 0, fb.width, fb.height, BG) };
     c.enabled = true;
@@ -56,6 +62,9 @@ pub fn write_str(s: &str) {
     }
     for b in s.bytes() {
         c.put_byte(b);
+    }
+    if let (Some((y0, y1)), Some(fb)) = (c.dirty.take(), c.fb) {
+        crate::drivers::gpu::flush(0, y0, fb.width, y1 - y0);
     }
 }
 
@@ -115,6 +124,7 @@ impl Console {
 
     fn scroll(&mut self) {
         let Some(fb) = self.fb else { return };
+        self.dirty = Some((0, fb.height));
         let line = GLYPH_H * fb.pitch;
         // SAFETY: both ranges lie inside the framebuffer (rows*GLYPH_H <= height).
         unsafe {
@@ -123,8 +133,13 @@ impl Console {
         }
     }
 
-    fn glyph(&self, col: usize, row: usize, ch: u8) {
+    fn glyph(&mut self, col: usize, row: usize, ch: u8) {
         let Some(fb) = self.fb else { return };
+        let (ya, yb) = (row * GLYPH_H, (row + 1) * GLYPH_H);
+        self.dirty = Some(match self.dirty {
+            Some((a, b)) => (a.min(ya), b.max(yb)),
+            None => (ya, yb),
+        });
         let g = &FONT8X16[(ch - 32) as usize];
         let (fgp, bgp) = (fb.pack(self.fg), fb.pack(BG));
         let x0 = col * GLYPH_W;

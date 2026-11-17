@@ -7,6 +7,7 @@
 //! store. Writes always go to the store, are buffered in memory (max 4 MiB) and committed atomically on close /
 //! process exit. `upd.*` is the kernel updater's namespace and can never be written by a foreign program.
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -83,8 +84,165 @@ pub enum Data {
     Static(&'static [u8]),
     Shared(Arc<Vec<u8>>),
     Buf(Vec<u8>),
+    /// A persistent-store file of at least `LAZY_MIN` bytes (or one that grew past it): never held in memory as a
+    /// whole. Reads fetch 64 KiB-aligned blocks on demand, writes are gathered in a write-back buffer and applied
+    /// with the store's copy-on-write `write_at`.
+    Pfs(Box<PfsFile>),
     /// directory listing snapshot (names), see `open_dir`
     Dir(Vec<String>),
+}
+
+/// Files at least this big are opened as `Data::Pfs` instead of being loaded into memory.
+pub const LAZY_MIN: usize = 1 << 20;
+const RC_BYTES: usize = 256 * 1024;
+const WB_MAX: usize = 4 * 1024 * 1024;
+const IO_SLICE: usize = 1024 * 1024;
+
+pub struct PfsFile {
+    /// store-relative canonical path
+    pub path: String,
+    pub size: u64,
+    rc_off: u64,
+    rc: Vec<u8>,
+    wb_off: u64,
+    wb: Vec<u8>,
+}
+
+impl PfsFile {
+    pub fn new(path: String, size: u64) -> PfsFile {
+        PfsFile { path, size, rc_off: 0, rc: Vec::new(), wb_off: 0, wb: Vec::new() }
+    }
+}
+
+fn store_io<R>(f: impl FnOnce(&mut crate::store::Store<crate::drivers::blk::Disk>) -> Result<R, crate::store::StoreErr>) -> Result<R, i64> {
+    match crate::store::with(f) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.errno()),
+        Err(_) => Err(EIO),
+    }
+}
+
+fn pfs_flush_wb(pf: &mut PfsFile) -> Result<(), i64> {
+    if pf.wb.is_empty() {
+        return Ok(());
+    }
+    let data = core::mem::take(&mut pf.wb);
+    let off = pf.wb_off;
+    let mut done = 0usize;
+    while done < data.len() {
+        let n = (data.len() - done).min(WB_MAX);
+        store_io(|s| s.write_at(&pf.path, off + done as u64, &data[done..done + n]))?;
+        done += n;
+    }
+    Ok(())
+}
+
+fn pfs_read(pf: &mut PfsFile, pos: &mut usize, out: &mut [u8]) -> usize {
+    let p = *pos as u64;
+    if p >= pf.size || out.is_empty() {
+        return 0;
+    }
+    if pfs_flush_wb(pf).is_err() {
+        return 0;
+    }
+    let total = out.len().min((pf.size - p) as usize);
+    let mut done = 0usize;
+    while done < total {
+        let cur = p + done as u64;
+        if cur >= pf.rc_off && cur < pf.rc_off + pf.rc.len() as u64 {
+            let o = (cur - pf.rc_off) as usize;
+            let k = (pf.rc.len() - o).min(total - done);
+            out[done..done + k].copy_from_slice(&pf.rc[o..o + k]);
+            done += k;
+            continue;
+        }
+        let remaining = total - done;
+        if remaining >= RC_BYTES {
+            // large read: straight into the caller's buffer, bypassing the cache
+            let want = remaining.min(IO_SLICE);
+            match store_io(|s| s.read_at(&pf.path, cur, &mut out[done..done + want])) {
+                Ok(n) if n > 0 => done += n,
+                _ => break,
+            }
+            continue;
+        }
+        let start = cur & !(crate::store::CHUNK as u64 - 1);
+        let want = RC_BYTES.min((pf.size - start) as usize);
+        pf.rc.clear();
+        pf.rc.resize(want, 0);
+        let got = {
+            let rc = &mut pf.rc;
+            store_io(|s| s.read_at(&pf.path, start, rc))
+        };
+        match got {
+            Ok(n) if n == want => pf.rc_off = start,
+            _ => {
+                pf.rc.clear();
+                break;
+            }
+        }
+    }
+    *pos += done;
+    done
+}
+
+fn pfs_write(pf: &mut PfsFile, pos: &mut usize, data: &[u8]) -> Result<usize, i64> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let p = *pos as u64;
+    let end = p.checked_add(data.len() as u64).ok_or(EFBIG)?;
+    if end > crate::store::MAX_FILE_BYTES as u64 {
+        return Err(EFBIG);
+    }
+    pf.rc.clear();
+    let contiguous = !pf.wb.is_empty() && p == pf.wb_off + pf.wb.len() as u64 && pf.wb.len() + data.len() <= WB_MAX;
+    if !contiguous {
+        pfs_flush_wb(pf)?;
+        if data.len() >= WB_MAX {
+            // too big to gather: write it through in slices
+            let mut done = 0usize;
+            while done < data.len() {
+                let n = (data.len() - done).min(WB_MAX);
+                store_io(|s| s.write_at(&pf.path, p + done as u64, &data[done..done + n]))?;
+                done += n;
+            }
+            pf.size = pf.size.max(end);
+            *pos = end as usize;
+            return Ok(data.len());
+        }
+        pf.wb_off = p;
+    }
+    pf.wb.extend_from_slice(data);
+    pf.size = pf.size.max(end);
+    *pos = end as usize;
+    if pf.wb.len() >= WB_MAX {
+        pfs_flush_wb(pf)?;
+    }
+    Ok(data.len())
+}
+
+/// Truncate or zero-extend a paged file.
+pub fn pfs_set_len(pf: &mut PfsFile, len: u64) -> Result<(), i64> {
+    pfs_flush_wb(pf)?;
+    pf.rc.clear();
+    store_io(|s| s.truncate(&pf.path, len))?;
+    pf.size = len;
+    Ok(())
+}
+
+/// A buffered in-memory file that grew past `LAZY_MIN`: persist what it has (atomically) and continue paged.
+fn promote(f: &mut OpenFile) -> Result<(), i64> {
+    let Data::Buf(buf) = &f.data else { return Ok(()) };
+    if f.name.starts_with("tmp/") || !store_ready() {
+        return Ok(());
+    }
+    let path = String::from(pfs_rel(&f.name).unwrap_or(&f.name));
+    let len = buf.len() as u64;
+    store_io(|s| s.write(&path, buf))?;
+    f.data = Data::Pfs(Box::new(PfsFile::new(path, len)));
+    f.dirty = false;
+    Ok(())
 }
 
 pub struct OpenFile {
@@ -102,14 +260,17 @@ impl OpenFile {
             Data::Static(s) => s,
             Data::Shared(v) => v,
             Data::Buf(v) => v,
-            Data::Dir(_) | Data::Pipe(_) | Data::Sock(_) | Data::Epoll(_) | Data::Event(_) | Data::Random | Data::Null | Data::Zero => &[],
+            Data::Pfs(_) | Data::Dir(_) | Data::Pipe(_) | Data::Sock(_) | Data::Epoll(_) | Data::Event(_) | Data::Random | Data::Null | Data::Zero => &[],
         }
     }
     pub fn is_dir(&self) -> bool {
         matches!(self.data, Data::Dir(_))
     }
     pub fn len(&self) -> usize {
-        self.bytes().len()
+        match &self.data {
+            Data::Pfs(pf) => pf.size as usize,
+            _ => self.bytes().len(),
+        }
     }
 }
 
@@ -420,10 +581,15 @@ fn open_pfs(p: &Arc<Process>, abs: &str, rel: &str, write: bool, create: bool, t
             let ents = pfs_do(|s| s.readdir(rel))?;
             Ok(dir_file(abs, ents.into_iter().map(|e| (e.name, e.kind == crate::store::Kind::Dir)).collect()))
         }
-        Ok(_) => {
+        Ok(st) => {
             let real = pfs_do(|s| s.realpath(rel, true))?;
             if write && pfs_guarded(&real, false) {
                 return Err(EACCES);
+            }
+            if st.size as usize >= LAZY_MIN && !(write && trunc) {
+                let pos = if write && append { st.size as usize } else { 0 };
+                let pf = PfsFile::new(real.clone(), st.size);
+                return Ok(OpenFile { name: alloc::format!("store/{}", real), data: Data::Pfs(Box::new(pf)), pos, writable: write, dirty: false, eof: false });
             }
             if write {
                 let buf: Vec<u8> = if trunc { Vec::new() } else { pfs_do(|s| s.read(rel))? };
@@ -810,6 +976,11 @@ pub fn flush(f: &mut OpenFile) -> Result<(), i64> {
     if !f.writable || !f.dirty {
         return Ok(());
     }
+    if let Data::Pfs(pf) = &mut f.data {
+        let r = pfs_flush_wb(pf);
+        f.dirty = false;
+        return r;
+    }
     if f.name.starts_with("tmp/") {
         return match crate::fs::tmpfs::write(&f.name, f.bytes()) {
             Ok(()) => {
@@ -836,6 +1007,7 @@ pub fn clone_open(f: &OpenFile) -> Option<OpenFile> {
     let data = match &f.data {
         Data::Static(s) => Data::Static(s),
         Data::Shared(v) => Data::Shared(v.clone()),
+        Data::Pfs(pf) if !f.writable => Data::Pfs(Box::new(PfsFile::new(pf.path.clone(), pf.size))),
         Data::Pipe(p) => Data::Pipe(p.dup()),
         Data::Event(e) => Data::Event(EventFd { counter: e.counter.clone(), semaphore: e.semaphore, nonblock: e.nonblock }),
         _ => return None,
@@ -870,6 +1042,9 @@ pub fn read(f: &mut OpenFile, out: &mut [u8]) -> usize {
         }
         return n;
     }
+    if let Data::Pfs(pf) = &mut f.data {
+        return pfs_read(pf, &mut f.pos, out);
+    }
     let b = f.bytes();
     if f.pos >= b.len() {
         return 0;
@@ -901,9 +1076,17 @@ pub fn write(f: &mut OpenFile, data: &[u8]) -> Result<usize, i64> {
         q.extend(data.iter().copied());
         return Ok(data.len());
     }
+    if matches!(f.data, Data::Buf(_)) && !data.is_empty() && f.pos.saturating_add(data.len()) > LAZY_MIN {
+        promote(f)?;
+    }
+    if let Data::Pfs(pf) = &mut f.data {
+        let n = pfs_write(pf, &mut f.pos, data)?;
+        f.dirty = true;
+        return Ok(n);
+    }
     let Data::Buf(buf) = &mut f.data else { return Err(EBADF) };
     let end = f.pos.checked_add(data.len()).ok_or(EFBIG)?;
-    if end > crate::store::MAX_FILE_BYTES {
+    if end > crate::store::MAX_INMEM_BYTES {
         return Err(EFBIG);
     }
     if buf.len() < end {

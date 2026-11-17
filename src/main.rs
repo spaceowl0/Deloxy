@@ -200,6 +200,7 @@ pub extern "C" fn kmain() -> ! {
     init_initramfs();
     init_rootfs();
     drivers::pci::init();
+    drivers::gpu::init();
     rand::probe_virtio_rng();
     rand::init();
     net::init();

@@ -97,6 +97,9 @@ pub struct Module {
     pub entry: u64,
     /// exception directory (.pdata): RVA and size in bytes
     pub pdata: (u32, u32),
+    /// implicit TLS of a DLL: (template start, end, zero-fill, address of its TLS index) and TLS callbacks
+    pub tls: Option<(u64, u64, u32, u64)>,
+    pub tls_cbs: Vec<u64>,
     pub exports: Vec<Export>,
     /// LoadLibrary reference count (static imports count as one)
     pub refs: u32,
@@ -126,7 +129,7 @@ pub enum ModRef {
 
 /// Name of the built-in user-mode SEH runtime DLL and the system-DLL imports it provides.
 pub const SEH_RT_NAME: &str = "deloxy_seh";
-pub const SEH_RT_EXPORTS: &[&str] = &["RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlUnwindEx", "RtlUnwind", "__C_specific_handler"];
+pub const SEH_RT_EXPORTS: &[&str] = &["RtlLookupFunctionEntry", "RtlVirtualUnwind", "RtlUnwindEx", "RtlUnwind", "__C_specific_handler", "RtlAddFunctionTable", "RtlDeleteFunctionTable"];
 
 /// Lower-case base name without directory and without ".dll".
 pub fn norm_name(n: &str) -> String {
@@ -314,6 +317,7 @@ struct Image {
     segments: Vec<Segment>,
     patches: Vec<Patch>,
     tls: Option<(u64, u64, u32, u64)>,
+    tls_cbs: Vec<u64>,
     idx: Option<usize>,
 }
 
@@ -373,7 +377,19 @@ pub fn plan(d: &[u8], finder: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Plan, 
         off += dp.bytes.len();
         dp.module.attached = true;
     }
-    let dll_init: Vec<(u64, u64)> = ctx.init_order.iter().filter(|&&i| ctx.mods[i].module.entry != 0).map(|&i| (ctx.mods[i].module.base, ctx.mods[i].module.entry)).collect();
+    let mut dll_init: Vec<(u64, u64)> = Vec::new();
+    for &i in ctx.init_order.iter() {
+        let m = &ctx.mods[i].module;
+        for &cb in m.tls_cbs.iter() {
+            dll_init.push((m.base, cb));
+        }
+        if m.entry != 0 {
+            dll_init.push((m.base, m.entry));
+        }
+    }
+    for &cb in img.tls_cbs.iter() {
+        dll_init.push((img.base, cb));
+    }
     let modules: Vec<Module> = ctx.mods.iter().map(|m| m.module.clone()).collect();
     Ok(Plan {
         abi: AbiKind::Nt,
@@ -393,6 +409,7 @@ pub fn plan(d: &[u8], finder: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Plan, 
         modules,
         dll_init,
         exe_info: img.exe_info,
+        tls_cbs: img.tls_cbs.clone(),
     })
 }
 
@@ -515,7 +532,7 @@ fn plan_image(d: &[u8], mode: Mode, ctx: &mut DllCtx) -> Result<Image, ExecError
         let (exp_rva, exp_size) = dir(0)?;
         let exports = parse_exports(d, &secs, size_of_headers, exp_rva, exp_size)?;
         let entry = if entry_rva != 0 { base.checked_add(entry_rva).ok_or(ExecError::BadRange)? } else { 0 };
-        ctx.mods.push(DllPlan { module: Module { name: name.clone(), base, size: size_of_image, entry, pdata: dir(3)?, exports, refs: 1, attached: false }, bytes: Vec::new(), segments: Vec::new(), patches: Vec::new() });
+        ctx.mods.push(DllPlan { module: Module { name: name.clone(), base, size: size_of_image, entry, pdata: dir(3)?, tls: None, tls_cbs: Vec::new(), exports, refs: 1, attached: false }, bytes: Vec::new(), segments: Vec::new(), patches: Vec::new() });
         Some(ctx.mods.len() - 1)
     } else {
         None
@@ -583,14 +600,29 @@ fn plan_image(d: &[u8], mode: Mode, ctx: &mut DllCtx) -> Result<Image, ExecError
         }
     }
 
-    // TLS directory: static TLS template; callbacks are ignored (documented limit)
-    let tls = if tls_rva != 0 && !is_dll {
+    // TLS directory: the static TLS template (executables and DLLs) and the callback array
+    let mut tls_cbs: Vec<u64> = Vec::new();
+    let tls = if tls_rva != 0 {
         let o = rva_to_off(&secs, size_of_headers, tls_rva, 40)?;
         let (start, end, index) = (u64_at(d, o)?, u64_at(d, o + 8)?, u64_at(d, o + 16)?);
+        let cb_va = u64_at(d, o + 24)?;
         let zero = u32_at(d, o + 32)?;
         let adj = |va: u64| va.wrapping_sub(pref_base).wrapping_add(base);
         if end < start || end - start > 1 << 20 || zero > 1 << 20 {
             return Err(ExecError::Unsupported("TLS template too large"));
+        }
+        if cb_va != 0 {
+            // the callbacks are absolute VAs (relocated like any pointer): read them from the file image
+            let cb_rva = (cb_va.wrapping_sub(pref_base)) as u32;
+            let mut co = rva_to_off(&secs, size_of_headers, cb_rva, 8)?;
+            for _ in 0..16 {
+                let f = u64_at(d, co)?;
+                if f == 0 {
+                    break;
+                }
+                tls_cbs.push(adj(f));
+                co += 8;
+            }
         }
         Some((adj(start), adj(end), zero, adj(index)))
     } else {
@@ -602,5 +634,9 @@ fn plan_image(d: &[u8], mode: Mode, ctx: &mut DllCtx) -> Result<Image, ExecError
         ctx.mods[i].patches = core::mem::take(&mut patches);
         ctx.init_order.push(i);
     }
-    Ok(Image { exe_info: (size_of_image, dir(3)?.0, dir(3)?.1), entry: base.checked_add(entry_rva).ok_or(ExecError::BadRange)?, base, segments, patches, tls, idx })
+    if let Some(i) = idx {
+        ctx.mods[i].module.tls = tls;
+        ctx.mods[i].module.tls_cbs = tls_cbs.clone();
+    }
+    Ok(Image { exe_info: (size_of_image, dir(3)?.0, dir(3)?.1), entry: base.checked_add(entry_rva).ok_or(ExecError::BadRange)?, base, segments, patches, tls: if idx.is_none() { tls } else { None }, tls_cbs: if idx.is_none() { tls_cbs } else { Vec::new() }, idx })
 }

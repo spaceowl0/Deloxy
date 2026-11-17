@@ -21,13 +21,27 @@ struct Inner {
 static TTY: IrqMutex<Inner> = IrqMutex::new(Inner { input: VecDeque::new(), out: VecDeque::new(), out_total: 0 });
 
 /// Queue input bytes (dropped when the queue is full).
+/// Foreground process group of the console. `u64::MAX` = no job-control shell has claimed it yet (legacy: Ctrl-C reaches
+/// the programs the shell started); `0` = the shell itself owns the terminal; otherwise a process group id.
+static FG_PGID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub fn foreground() -> u64 {
+    FG_PGID.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_foreground(pgid: u64) {
+    FG_PGID.store(pgid, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn push_input(bytes: &[u8]) {
-    // Ctrl-C interrupts the programs the shell started (instead of being typed into them)
+    // Ctrl-C interrupts, Ctrl-Z stops the foreground job (instead of being typed into it)
     let mut filtered: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let bytes = if bytes.contains(&0x03) {
+    let bytes = if bytes.contains(&0x03) || bytes.contains(&0x1A) {
         for &b in bytes {
             if b == 0x03 && crate::abi::signals::interrupt_foreground() {
                 write(b"^C\r\n");
+            } else if b == 0x1A && crate::abi::signals::stop_foreground() {
+                write(b"^Z\r\n");
             } else {
                 filtered.push(b);
             }

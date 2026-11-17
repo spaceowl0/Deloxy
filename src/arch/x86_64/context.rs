@@ -79,7 +79,8 @@ pub fn enable_fpu() {
     unsafe {
         Cr0::update(|f| {
             f.remove(Cr0Flags::EMULATE_COPROCESSOR);
-            f.insert(Cr0Flags::MONITOR_COPROCESSOR);
+            // MP + NE: x87 errors raise #MF; AM: a program that sets EFLAGS.AC gets #AC on misaligned accesses
+            f.insert(Cr0Flags::MONITOR_COPROCESSOR | Cr0Flags::NUMERIC_ERROR | Cr0Flags::ALIGNMENT_MASK);
         });
         Cr4::update(|f| f.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE));
     }

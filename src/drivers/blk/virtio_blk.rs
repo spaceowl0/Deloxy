@@ -19,8 +19,8 @@ const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 const QSZ: u16 = 8;
-/// Largest transfer per request: one 4 KiB bounce frame (8 sectors).
-pub const MAX_SECTORS_PER_REQ: u64 = 8;
+/// Preferred bounce buffer: 64 contiguous frames = 256 KiB = 512 sectors per request (falls back to one 4 KiB frame).
+const BOUNCE_FRAMES: usize = 64;
 const SPIN_LIMIT: u64 = 400_000_000;
 
 pub struct VirtioBlk {
@@ -29,6 +29,8 @@ pub struct VirtioBlk {
     /// frame 0: request header (16 B) + status byte at 16; frame 1: data bounce buffer
     hdr: PhysFrame<Size4KiB>,
     data: PhysFrame<Size4KiB>,
+    /// sectors one request can move (size of the bounce buffer)
+    max_sectors: u64,
     capacity: u64,
     read_only: bool,
     flush: bool,
@@ -52,11 +54,14 @@ impl VirtioBlk {
         q.set_notify(t.notify_ptr(0));
         t.driver_ok();
         let hdr = frame::allocate_frame().ok_or("blk hdr alloc")?;
-        let data = frame::allocate_frame().ok_or("blk data alloc")?;
+        let (data, max_sectors) = match frame::allocate_contiguous(BOUNCE_FRAMES, 1) {
+            Some(f) => (f, (BOUNCE_FRAMES * 4096 / SECTOR) as u64),
+            None => (frame::allocate_frame().ok_or("blk data alloc")?, 8),
+        };
         if capacity == 0 {
             return Err("virtio-blk reports zero capacity");
         }
-        Ok(VirtioBlk { t, q, hdr, data, capacity, read_only: feats_ro, flush, failed: false, reads: 0, writes: 0 })
+        Ok(VirtioBlk { t, q, hdr, data, max_sectors, capacity, read_only: feats_ro, flush, failed: false, reads: 0, writes: 0 })
     }
 
     fn device_features(t: &Transport) -> u64 {
@@ -81,7 +86,7 @@ impl VirtioBlk {
             return Err(BlkErr::Io);
         }
         if ty != T_FLUSH {
-            if nsec == 0 || nsec > MAX_SECTORS_PER_REQ {
+            if nsec == 0 || nsec > self.max_sectors {
                 return Err(BlkErr::Invalid);
             }
             if sector.checked_add(nsec).map_or(true, |e| e > self.capacity) {
@@ -142,7 +147,7 @@ impl VirtioBlk {
         if buf.len() % SECTOR != 0 {
             return Err(BlkErr::Invalid);
         }
-        for chunk in buf.chunks_mut(MAX_SECTORS_PER_REQ as usize * SECTOR) {
+        for chunk in buf.chunks_mut(self.max_sectors as usize * SECTOR) {
             let n = (chunk.len() / SECTOR) as u64;
             self.request(T_IN, sector, n, None, Some(chunk))?;
             sector += n;
@@ -155,7 +160,7 @@ impl VirtioBlk {
         if buf.len() % SECTOR != 0 {
             return Err(BlkErr::Invalid);
         }
-        for chunk in buf.chunks(MAX_SECTORS_PER_REQ as usize * SECTOR) {
+        for chunk in buf.chunks(self.max_sectors as usize * SECTOR) {
             let n = (chunk.len() / SECTOR) as u64;
             self.request(T_OUT, sector, n, Some(chunk), None)?;
             sector += n;

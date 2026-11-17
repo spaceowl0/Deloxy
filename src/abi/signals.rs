@@ -159,9 +159,37 @@ pub fn park_if_stopped(p: &Arc<Process>) {
     }
 }
 
-/// Ctrl-C on the console: SIGINT to the process group(s) of the programs the shell started (top-level foreign
-/// processes attached to the console). `false` = no such program (the byte is then ordinary input).
+/// Send `sig` to every Linux process of group `pgid`; returns how many were signalled.
+pub fn signal_group(pgid: u64, sig: u64) -> usize {
+    let mut n = 0;
+    for p in task::list_processes() {
+        if p.has_exited() || p.abi() != super::AbiKind::Linux || pgid_of(&p) != pgid {
+            continue;
+        }
+        send(&p, sig);
+        n += 1;
+    }
+    n
+}
+
+/// Ctrl-Z: SIGTSTP to the foreground job (only once a job-control shell has claimed the terminal).
+pub fn stop_foreground() -> bool {
+    let fg = crate::tty::foreground();
+    fg != u64::MAX && fg != 0 && signal_group(fg, SIGTSTP) > 0
+}
+
+/// Ctrl-C on the console. With a job-control shell (`tty::foreground()` is a group id or 0): SIGINT to the foreground
+/// group, nothing at all while the shell owns the terminal. Without one (legacy): SIGINT to the process group(s) of
+/// the programs the shell started (top-level foreign processes attached to the console). `false` = no target (the byte
+/// is then ordinary input).
 pub fn interrupt_foreground() -> bool {
+    let fg = crate::tty::foreground();
+    if fg == 0 {
+        return false;
+    }
+    if fg != u64::MAX {
+        return signal_group(fg, SIGINT) > 0;
+    }
     let all = task::list_processes();
     let mut groups: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
     for p in all.iter() {
@@ -647,7 +675,7 @@ pub fn rt_sigreturn(p: &Arc<Process>, f: &mut SyscallFrame) -> i64 {
     f.rdx = r(12);
     f.rip = rip;
     f.rsp = rsp;
-    f.rflags = (r(17) & 0x8D5) | 0x202; // only CF PF AF ZF SF DF OF are user-modifiable; IF stays on
+    f.rflags = (r(17) & super::win_exc::FLAGS_USER) | 0x202; // CF PF AF ZF SF TF DF OF AC are user-modifiable; IF stays on
     let fp = u64::from_le_bytes(uc[G_FPPTR..G_FPPTR + 8].try_into().unwrap());
     if fp != 0 && is_user_addr(fp) && fp % 16 == 0 {
         let mut fx = Fx([0; 512]);
@@ -669,7 +697,7 @@ pub fn rt_sigreturn(p: &Arc<Process>, f: &mut SyscallFrame) -> i64 {
         let tf = crate::arch::x86_64::idt::TrapFrame {
             r15: f.r15, r14: f.r14, r13: f.r13, r12: f.r12, r11: r(3), r10: f.r10, r9: f.r9, r8: f.r8, rbp: f.rbp, rdi: f.rdi,
             rsi: f.rsi, rdx: f.rdx, rcx: r(14), rbx: f.rbx, rax: r(13), vector: 0, error: 0, rip: f.rip,
-            cs: s.user_code.0 as u64, rflags: f.rflags, rsp: f.rsp, ss: s.user_data.0 as u64,
+            cs: s.user_code.0 as u64, rflags: (f.rflags & super::win_exc::FLAGS_USER) | 0x202, rsp: f.rsp, ss: s.user_data.0 as u64,
         };
         // SAFETY: rip/rsp were checked to be user addresses above; the selectors are the user segments; rflags is sanitised.
         unsafe { crate::arch::x86_64::idt::iret_trapframe(&tf) }
@@ -699,7 +727,8 @@ pub fn deliver_fault(p: &Arc<Process>, sig: u64, tf: &mut crate::arch::x86_64::i
     tf.rdi = f.rdi;
     tf.rsi = f.rsi;
     tf.rdx = f.rdx;
-    tf.rflags = f.rflags;
+    // the handler never single-steps or runs with alignment checking (the saved context keeps both)
+    tf.rflags = f.rflags & !(0x100 | 0x40000);
     tf.rax = 0;
     let mut g = p.foreign.lock();
     let mut m = tmask(g.sig.mask) | act.mask;

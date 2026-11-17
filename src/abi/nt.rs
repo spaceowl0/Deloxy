@@ -27,6 +27,13 @@ pub const START_VA: u64 = NT_THUNK_BASE + 0x3F00;
 /// PEB page + 0x400: queued `{entry, hinst, reason}` records; + 0x3F0: the executable's real entry point.
 pub const LIST_VA: u64 = NT_DATA_BASE + PAGE_SIZE + 0x400;
 pub const ENTRY_SLOT_VA: u64 = NT_DATA_BASE + PAGE_SIZE + 0x3F0;
+/// Thunk-page stubs for DLL/TLS notifications (assembled from user/seh/stubs/*.asm, see tools/gen-nt-stubs.sh)
+pub const NOTIFY_RUN_VA: u64 = NT_THUNK_BASE + 0x3E40;
+pub const THREAD_START_VA: u64 = NT_THUNK_BASE + 0x3E90;
+pub const EXIT_THREAD_VA: u64 = NT_THUNK_BASE + 0x3F40;
+pub const EXIT_PROCESS_VA: u64 = NT_THUNK_BASE + 0x3F80;
+/// Zero-terminated list of {function, module} the notify runner calls on thread attach/detach and process detach
+pub const NOTIFY_LIST_VA: u64 = NT_DATA_BASE + PAGE_SIZE + 0x800;
 
 /// machine code of the two stubs above (assembled from tools/asm; see exec/dll.rs)
 static CONT_CODE: [u8; 60] = [0x53, 0x56, 0x48, 0x89, 0xC6, 0x4C, 0x89, 0xC3, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x03, 0x48, 0x85, 0xC0, 0x74, 0x1E, 0x48, 0x8B, 0x4B, 0x08, 0x8B, 0x53, 0x10, 0x45, 0x31, 0xC0, 0xFF, 0xD0, 0x83, 0x7B, 0x10, 0x01, 0x75, 0x06, 0x85, 0xC0, 0x75, 0x02, 0x31, 0xF6, 0x48, 0x83, 0xC3, 0x18, 0xEB, 0xDA, 0x48, 0x89, 0xF0, 0x48, 0x83, 0xC4, 0x28, 0x5E, 0x5B, 0xC3];
@@ -583,6 +590,15 @@ pub fn resolve(dll: &str, name: &str) -> Option<u64> {
     if !k32 && !crt && !wsock {
         return None;
     }
+    if k32 {
+        // user-mode wrappers that run the DLL detach notifications before the real exit
+        if name == "ExitThread" {
+            return Some(EXIT_THREAD_VA);
+        }
+        if name == "ExitProcess" {
+            return Some(EXIT_PROCESS_VA);
+        }
+    }
     if crt {
         if let Some(a) = float_stub_addr(name) {
             return Some(a);
@@ -734,6 +750,41 @@ fn float_stub(kind: u8, nr: u32) -> [u8; 32] {
     s
 }
 
+/// Write the notify list (see `NOTIFY_LIST_VA`): per module its TLS callbacks then its DllMain, the executable's TLS
+/// callbacks last. Called at process start and whenever a DLL is attached or detached.
+fn write_notify_list_from(p: &Arc<Process>, modules: &[crate::exec::pe::Module], exe_cbs: &[u64], image_base: u64) -> Result<(), ExecError> {
+    let mut v: Vec<u8> = Vec::new();
+    let mut n = 0;
+    let mut push = |f: u64, m: u64, v: &mut Vec<u8>| {
+        if n < 48 {
+            v.extend_from_slice(&f.to_le_bytes());
+            v.extend_from_slice(&m.to_le_bytes());
+            n += 1;
+        }
+    };
+    for m in modules.iter().filter(|m| m.attached) {
+        for &cb in m.tls_cbs.iter() {
+            push(cb, m.base, &mut v);
+        }
+        if m.entry != 0 {
+            push(m.entry, m.base, &mut v);
+        }
+    }
+    for &cb in exe_cbs {
+        push(cb, image_base, &mut v);
+    }
+    v.extend_from_slice(&[0u8; 16]);
+    write_user(p, NOTIFY_LIST_VA, &v)
+}
+
+pub fn write_notify_list(p: &Arc<Process>) {
+    let (mods, cbs, base) = {
+        let g = p.foreign.lock();
+        (g.modules.clone(), g.exe_tls_cbs.clone(), g.image_base)
+    };
+    let _ = write_notify_list_from(p, &mods, &cbs, base);
+}
+
 /// Address of the stub for shim `idx` (stub 0 is the "process return" stub).
 pub fn thunk_addr(idx: usize) -> u64 {
     NT_THUNK_BASE + 16 * (idx as u64 + 1)
@@ -765,8 +816,11 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
         return Err(ExecError::Unsupported("too many shims"));
     }
     page.resize(c::CODE_OFF as usize, 0xCC);
-    let exit_thunk = SHIMS.iter().position(|(n, _)| *n == "_exit").map(thunk_addr).unwrap_or(0);
-    let thread_exit_thunk = SHIMS.iter().position(|(n, _)| *n == "ExitThread").map(thunk_addr).unwrap_or(0);
+    // exit()/ExitProcess/ExitThread go through stubs that first run the DLL_PROCESS_DETACH / DLL_THREAD_DETACH notifications
+    let real_exit_process = SHIMS.iter().position(|(n, _)| *n == "ExitProcess").map(thunk_addr).unwrap_or(0);
+    let real_exit_thread = SHIMS.iter().position(|(n, _)| *n == "ExitThread").map(thunk_addr).unwrap_or(0);
+    let exit_thunk = EXIT_PROCESS_VA;
+    let thread_exit_thunk = EXIT_THREAD_VA;
     for (_, code) in c::CODE_STUBS {
         let mut st = c::build_stub(code, exit_thunk, thread_exit_thunk);
         st.resize(c::CODE_STRIDE as usize, 0xCC);
@@ -782,8 +836,24 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
     page.extend_from_slice(&super::win_exc::exc_ret_stub(exc_nr));
     page.resize((CONT_VA - NT_THUNK_BASE) as usize, 0xCC);
     page.extend_from_slice(&CONT_CODE);
+    page.resize((NOTIFY_RUN_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&super::nt_stubs::NOTIFY_RUN);
+    page.resize((THREAD_START_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&super::nt_stubs::THREAD_START);
     page.resize((START_VA - NT_THUNK_BASE) as usize, 0xCC);
     page.extend_from_slice(&START_CODE);
+    let patch = |code: &[u8], magic: u64, val: u64| -> Vec<u8> {
+        let mut v = code.to_vec();
+        let m = magic.to_le_bytes();
+        if let Some(i) = v.windows(8).position(|w| w == m) {
+            v[i..i + 8].copy_from_slice(&val.to_le_bytes());
+        }
+        v
+    };
+    page.resize((EXIT_THREAD_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&patch(&super::nt_stubs::EXIT_THREAD, 0xBBBB_BBBB_BBBB_BBBB, real_exit_thread));
+    page.resize((EXIT_PROCESS_VA - NT_THUNK_BASE) as usize, 0xCC);
+    page.extend_from_slice(&patch(&super::nt_stubs::EXIT_PROCESS, 0xAAAA_AAAA_AAAA_AAAA, real_exit_process));
     write_user(p, NT_THUNK_BASE, &page)?;
     {
         let mut g = p.space.lock();
@@ -807,20 +877,39 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
     w64(teb + 0x40, p.pid)?; // ClientId.UniqueProcess
     w64(teb + 0x48, 1)?; // UniqueThread
     w64(teb + 0x60, peb)?; // ProcessEnvironmentBlock
-    if let Some((start, end, zero, index_va)) = plan.tls {
-        // static TLS: one block (template + zero fill) reached through TEB.ThreadLocalStoragePointer[tls_index]
-        let len = (end - start) as usize;
-        let total = len + zero as usize;
-        let pages = ((total as u64 + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as usize;
-        let va = p.mmap_next.fetch_add((pages as u64 + 1) * PAGE_SIZE, core::sync::atomic::Ordering::SeqCst);
-        p.map_region(va, pages, VmFlags::WRITE | VmFlags::USER).map_err(oom)?;
-        let mut tmpl = alloc::vec![0u8; len];
-        copy_from_user(p, &mut tmpl, start).map_err(|_| ExecError::BadRange)?;
-        write_user(p, va, &tmpl)?;
-        let arr = DATA_PAGE3 + 0xF00;
-        w64(arr, va)?;
-        w64(teb + 0x58, arr)?;
-        write_user(p, index_va, &0u32.to_le_bytes())?;
+    {
+        // static TLS: per thread one block per module (template + zero fill), reached through
+        // TEB.ThreadLocalStoragePointer[tls_index]; the executable is index 0, DLLs with a TLS directory follow
+        let mut make_block = |start: u64, end: u64, zero: u32| -> Result<u64, ExecError> {
+            let len = (end - start) as usize;
+            let total = len + zero as usize;
+            let pages = ((total as u64 + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as usize;
+            let va = p.mmap_next.fetch_add((pages as u64 + 1) * PAGE_SIZE, core::sync::atomic::Ordering::SeqCst);
+            p.map_region(va, pages, VmFlags::WRITE | VmFlags::USER).map_err(oom)?;
+            let mut tmpl = alloc::vec![0u8; len];
+            copy_from_user(p, &mut tmpl, start).map_err(|_| ExecError::BadRange)?;
+            write_user(p, va, &tmpl)?;
+            Ok(va)
+        };
+        let dll_tls: Vec<(u64, (u64, u64, u32, u64))> = plan.modules.iter().filter_map(|m| m.tls).enumerate().map(|(k, t)| (k as u64 + 1, t)).collect();
+        if plan.tls.is_some() || !dll_tls.is_empty() {
+            let arr = DATA_PAGE3 + 0xF00;
+            if dll_tls.len() > 24 {
+                return Err(ExecError::Unsupported("too many DLLs with thread-local storage"));
+            }
+            if let Some((start, end, zero, index_va)) = plan.tls {
+                w64(arr, make_block(start, end, zero)?)?;
+                write_user(p, index_va, &0u32.to_le_bytes())?;
+            }
+            let mut recorded: Vec<(u64, u64, u64, u32)> = Vec::new();
+            for (idx, (start, end, zero, index_va)) in dll_tls {
+                w64(arr + 8 * idx, make_block(start, end, zero)?)?;
+                write_user(p, index_va, &(idx as u32).to_le_bytes())?;
+                recorded.push((idx, start, end, zero));
+            }
+            w64(teb + 0x58, arr)?;
+            p.foreign.lock().tls_dll = recorded;
+        }
     }
     p.foreign.lock().tls_tmpl = plan.tls;
     {
@@ -831,6 +920,7 @@ pub fn setup_process(p: &Arc<Process>, plan: &Plan, args: &[&str]) -> Result<(u6
         g.brk_base_hint = plan.segments.iter().map(|s| s.va + s.mem_len).max().unwrap_or(plan.image_base);
         g.dll_next = plan.modules.iter().map(|m| m.base + ((m.size + 0xFFFF) & !0xFFFF)).max().unwrap_or(0).max(crate::exec::pe::DLL_REGION);
     }
+    write_notify_list_from(p, &plan.modules, &plan.tls_cbs, plan.image_base)?;
     if !plan.dll_init.is_empty() {
         let mut list: Vec<u8> = Vec::new();
         for &(hinst, entry) in plan.dll_init.iter().take(40) {

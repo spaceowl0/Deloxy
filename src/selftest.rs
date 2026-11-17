@@ -1087,7 +1087,7 @@ fn test_store_logic() {
     check!(st.read("empty").unwrap().is_empty(), "empty file");
     check!(st.read("nope") == Err(StoreErr::NotFound), "missing file -> NotFound");
     check!(st.write("bad\0name", b"x") == Err(StoreErr::BadName), "bad name rejected");
-    check!(st.write("huge", &vec![0u8; crate::store::MAX_FILE_BYTES + 1]) == Err(StoreErr::TooLarge), "too large rejected");
+    check!(st.write("huge", &vec![0u8; crate::store::MAX_INMEM_BYTES + 1]) == Err(StoreErr::TooLarge), "too large rejected");
     st.write("hello.txt", b"replaced").unwrap();
     check!(st.read("hello.txt").unwrap() == b"replaced" && st.list().len() == 3, "atomic replace keeps one entry");
     let gen = st.stats().generation;
@@ -1132,6 +1132,7 @@ fn test_store_logic() {
     test_store_fragmentation();
     test_store_migration();
     test_store_crash();
+    test_store_v3();
     test_store_corruption();
     info!("selftest: store v2 ok (tree ops, symlinks, rename, fragmentation, v1 migration, torn writes in every operation, corruption fallback)");
 }
@@ -1316,6 +1317,241 @@ fn test_store_crash() {
     }
 }
 
+/// DeloxyStore v3: ranged I/O, chunk CRCs, free-space accounting, files beyond the old 16 MiB limit, torn `write_at`.
+fn test_store_v3() {
+    use crate::store::{RamDisk, Store, StoreErr, CHUNK, DATA_START};
+    fn pat(i: u64, salt: u64) -> u8 {
+        (i.wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503)) >> 7) as u8
+    }
+    fn invariant<D: crate::store::BlockDev>(st: &Store<D>) -> bool {
+        let s = st.stats();
+        st.free_bytes() + s.used_bytes == s.data_bytes
+    }
+
+    // --- a 20 MiB file (the old limit was 16 MiB) built from 1 MiB write_at calls
+    let mut st = Store::format(RamDisk::new(48 * 2048)).ok().expect("format 48 MiB");
+    let base_free = st.free_bytes();
+    check!(invariant(&st), "v3: fresh store accounting");
+    let mib = 1 << 20;
+    let mut blk = vec![0u8; mib];
+    for m in 0..20u64 {
+        for (i, b) in blk.iter_mut().enumerate() {
+            *b = pat(m * mib as u64 + i as u64, 1);
+        }
+        check!(st.write_at("big", m * mib as u64, &blk).is_ok(), "v3: write_at 1 MiB block {}", m);
+    }
+    check!(st.stat("big", true).unwrap().size == 20 * mib as u64, "v3: 20 MiB file size");
+    check!(invariant(&st), "v3: accounting after 20 MiB build");
+    let mut ok = true;
+    for &(off, len) in &[(0u64, 10usize), (65535, 3), (65536, 65536), (7 * mib as u64 + 12345, 300_000), (19 * mib as u64 + 1, mib - 1), (20 * mib as u64 - 5, 100)] {
+        let mut b = vec![0u8; len];
+        let n = st.read_at("big", off, &mut b).unwrap_or(usize::MAX);
+        let want = len.min((20 * mib as u64 - off) as usize);
+        ok &= n == want && (0..n).all(|i| b[i] == pat(off + i as u64, 1));
+    }
+    check!(ok, "v3: ranged reads across chunk boundaries and at EOF");
+    let mut z = [0u8; 4];
+    check!(st.read_at("big", 20 * mib as u64, &mut z) == Ok(0), "v3: read at EOF returns 0");
+    let whole = st.read("big").unwrap_or_default();
+    check!(whole.len() == 20 * mib && (0..whole.len()).step_by(4093).all(|i| whole[i] == pat(i as u64, 1)), "v3: whole-file read of the 20 MiB file");
+
+    // --- model test: random write_at / truncate against a Vec<u8>
+    let mut st = Store::format(RamDisk::new(8192)).ok().expect("format");
+    let mut model: Vec<u8> = Vec::new();
+    let mut seed = 0x1234_5678u64;
+    let mut rnd = move |m: u64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) % m
+    };
+    let mut good = true;
+    for step in 0..160u64 {
+        match rnd(10) {
+            0 | 1 => {
+                let l = rnd(400_000);
+                if st.truncate("m", l).is_ok() {
+                    model.resize(l as usize, 0);
+                } else if step == 0 {
+                    // the file does not exist yet: create it
+                    st.write_at("m", 0, &[1]).unwrap();
+                    model = vec![1];
+                }
+            }
+            _ => {
+                let off = rnd(model.len() as u64 + 90_000);
+                let len = 1 + rnd(150_000) as usize;
+                let data: Vec<u8> = (0..len).map(|i| pat(off + i as u64, step)).collect();
+                if st.write_at("m", off, &data).is_err() {
+                    good = false;
+                    break;
+                }
+                let end = off as usize + len;
+                if model.len() < end {
+                    model.resize(end, 0);
+                }
+                model[off as usize..end].copy_from_slice(&data);
+            }
+        }
+        if step % 20 == 19 {
+            let mut got = vec![0u8; model.len()];
+            let n = st.read_at("m", 0, &mut got).unwrap_or(0);
+            good &= n == model.len() && got == model && st.stat("m", true).map(|x| x.size) == Ok(model.len() as u64) && invariant(&st);
+            if !good {
+                break;
+            }
+        }
+    }
+    check!(good, "v3: 160 random write_at/truncate operations match the model, accounting holds");
+    let mut dev = st.into_dev();
+    dev.revive();
+    let mut st = Store::mount(dev).ok().expect("remount");
+    let mut got = vec![0u8; model.len()];
+    check!(st.read_at("m", 0, &mut got) == Ok(model.len()) && got == model, "v3: content survives a remount");
+    check!(invariant(&st), "v3: accounting after remount");
+    let free_before = st.free_bytes();
+    st.unlink("m").unwrap();
+    check!(st.free_bytes() > free_before && invariant(&st), "v3: unlink returns the file's sectors");
+
+    // --- leak check: churn, then delete everything; free space must return to the baseline up to the metadata image
+    let mut st = Store::format(RamDisk::new(4096)).ok().expect("format");
+    let f0 = st.free_bytes();
+    for r in 0..6u64 {
+        for n in 0..5u64 {
+            let name = alloc::format!("f{}", n);
+            st.write(&name, &vec![pat(r, n); 20_000 + (r * 3_000) as usize]).unwrap();
+            st.write_at(&name, 70_000, b"tail").unwrap();
+        }
+    }
+    for n in 0..5 {
+        st.unlink(&alloc::format!("f{}", n)).unwrap();
+    }
+    check!(invariant(&st) && f0 - st.free_bytes() <= 16 * 1024, "v3: no space leaks after churn ({} -> {})", f0, st.free_bytes());
+
+    // --- corruption in one chunk is detected only when that chunk is read
+    let mut st = Store::format(RamDisk::new(4096)).ok().expect("format");
+    let data: Vec<u8> = (0..3 * CHUNK).map(|i| pat(i as u64, 9) ^ ((i >> 16) as u8).wrapping_mul(37).wrapping_add(1)).collect();
+    st.write("c", &data).unwrap();
+    let start = DATA_START as usize * 512;
+    // the file is the first allocation after the initial metadata image: find its first sector by scanning for the pattern
+    let hay = st.dev_mut().data.clone();
+    let needle = &data[CHUNK..CHUNK + 64];
+    let at = (start..hay.len() - 64).step_by(512).find(|&o| &hay[o..o + 64] == needle).expect("find chunk 1 on disk");
+    st.dev_mut().data[at + 100] ^= 0x40;
+    let mut b = vec![0u8; 100];
+    check!(st.read_at("c", 0, &mut b) == Ok(100), "v3: chunk 0 still reads after chunk 1 was damaged");
+    check!(st.read_at("c", CHUNK as u64 + 50, &mut b) == Err(StoreErr::Corrupt), "v3: damaged chunk is detected by read_at");
+    check!(st.read("c") == Err(StoreErr::Corrupt), "v3: damaged chunk is detected by read");
+
+    // --- torn write_at: the file is either entirely old or entirely new
+    let old: Vec<u8> = (0..200_000).map(|i| pat(i as u64, 3)).collect();
+    let mut newc = old.clone();
+    for i in 0..5000 {
+        newc[CHUNK - 2000 + i] = 0xEE;
+    }
+    for k in 0..7usize {
+        let mut st = Store::format(RamDisk::new(4096)).ok().expect("format");
+        st.write("t", &old).unwrap();
+        {
+            let d = st.dev_mut();
+            d.revive();
+            d.fail_at_write = Some(k);
+        }
+        let r = st.write_at("t", (CHUNK - 2000) as u64, &[0xEE; 5000]);
+        let mut dev = st.into_dev();
+        dev.revive();
+        let mut st = Store::mount(dev).ok().expect("remount after torn write_at");
+        let mut got = vec![0u8; old.len()];
+        let n = st.read_at("t", 0, &mut got).unwrap_or(0);
+        check!(n == old.len() && (got == old || got == newc), "v3: torn write_at k={} left a mixed file", k);
+        check!(r.is_ok() == (got == newc), "v3: torn write_at k={}: result disagrees with disk", k);
+    }
+
+    // --- a legacy (v1/v2 style, whole-file CRC) file is verified, then upgraded on its first partial write
+    let mut dev = RamDisk::new(4096);
+    let legacy: Vec<u8> = (0..150_000).map(|i| pat(i as u64, 5)).collect();
+    crate::store::format_v1_for_test(&mut dev, &[("old.bin", &legacy)]);
+    let mut st = Store::mount(dev).ok().expect("mount v1");
+    let mut b = vec![0u8; 1000];
+    check!(st.read_at("old.bin", 140_000, &mut b) == Ok(1000) && b[..] == legacy[140_000..141_000], "v3: ranged read of a legacy file");
+    st.write_at("old.bin", 100, b"PATCH").unwrap();
+    let mut expect = legacy.clone();
+    expect[100..105].copy_from_slice(b"PATCH");
+    let mut got = vec![0u8; expect.len()];
+    check!(st.read_at("old.bin", 0, &mut got) == Ok(expect.len()) && got == expect && invariant(&st), "v3: legacy file upgraded by write_at");
+    st.truncate("old.bin", 10).unwrap();
+    check!(st.read("old.bin").unwrap() == expect[..10], "v3: truncate shrinks");
+    st.truncate("old.bin", 70_000).unwrap();
+    let r = st.read("old.bin").unwrap();
+    check!(r.len() == 70_000 && r[..10] == expect[..10] && r[10..].iter().all(|&x| x == 0) && invariant(&st), "v3: truncate grows with zeros");
+
+    // --- commit log: 700 creates/deletes cross several checkpoints; remount replays checkpoint + log exactly
+    let mut st = Store::format(RamDisk::new(8192)).ok().expect("format");
+    let mut live: Vec<(String, Vec<u8>)> = Vec::new();
+    for i in 0..700u64 {
+        if i % 5 == 4 && !live.is_empty() {
+            let (n, _) = live.remove((i as usize * 7) % live.len());
+            st.unlink(&n).unwrap();
+        } else {
+            let n = alloc::format!("f{}", i);
+            let d: Vec<u8> = (0..(10 + (i * 37) % 3000) as usize).map(|k| pat(k as u64, i)).collect();
+            st.write(&n, &d).unwrap();
+            live.push((n, d));
+        }
+    }
+    let gen_before = st.stats().generation;
+    check!(gen_before > 600 && invariant(&st), "v3 log: 700 commits, accounting holds");
+    let mut dev = st.into_dev();
+    dev.revive();
+    let mut st = Store::mount(dev).ok().expect("remount after 700 commits");
+    check!(st.stats().generation == gen_before && st.stats().files == live.len(), "v3 log: remount replays to the same generation and file count");
+    let mut all_ok = true;
+    for (n, d) in &live {
+        all_ok &= st.read(n).as_deref() == Ok(d.as_slice());
+    }
+    check!(all_ok && invariant(&st), "v3 log: every file intact after replay");
+
+    // --- a big directory must not force a checkpoint per commit (deltas log only the changed entries)
+    let mut st = Store::format(RamDisk::new(16384)).ok().expect("format");
+    let mut checkpoints = 0u32;
+    let mut last_ck = st.log_state().0;
+    for i in 0..2500u32 {
+        st.write(&alloc::format!("d{:05}", i), b"v").unwrap();
+        let ck = st.log_state().0;
+        if ck != last_ck {
+            checkpoints += 1;
+            last_ck = ck;
+        }
+    }
+    check!(checkpoints < 60, "v3 log: 2500 creates in one directory made {} checkpoints (expected < 60)", checkpoints);
+    let gen_now = st.stats().generation;
+    let mut dev = st.into_dev();
+    dev.revive();
+    let st = Store::mount(dev).ok().expect("remount big directory");
+    check!(st.stats().generation == gen_now && st.stats().files == 2500 && invariant(&st), "v3 log: big directory replays exactly");
+
+    // --- torn commit at every write of a commit, around the point where the log fills and a checkpoint is made
+    for after in 120..140usize {
+        for k in 0..7usize {
+            let mut st = Store::format(RamDisk::new(2048)).ok().expect("format");
+            for i in 0..after {
+                st.write(&alloc::format!("a{}", i), b"x").unwrap();
+            }
+            {
+                let d = st.dev_mut();
+                d.revive();
+                d.fail_at_write = Some(k);
+            }
+            let r = st.write("last", b"newest");
+            let mut dev = st.into_dev();
+            dev.revive();
+            let mut st = Store::mount(dev).ok().expect("remount after torn commit");
+            let has_last = st.read("last") == Ok(b"newest".to_vec());
+            check!(r.is_ok() == has_last, "v3 log: torn commit (after {} commits, k={}): result disagrees with disk", after, k);
+            check!(st.stats().files == after + has_last as usize && invariant(&st), "v3 log: torn commit (after {}, k={}) left a damaged tree", after, k);
+        }
+    }
+    log::info!("selftest: store v3 (ranged I/O, 20 MiB file, model test, torn write_at, legacy upgrade, commit log) ok");
+}
+
 fn test_store_corruption() {
     use crate::store::{RamDisk, Store, StoreErr, DATA_START};
     let mut st = Store::format(RamDisk::new(2048)).ok().unwrap();
@@ -1352,8 +1588,32 @@ fn test_store_corruption() {
             dev.data[mstart as usize * 512 + 20] ^= 0x01;
         }
     }
-    let st = Store::mount(dev).ok().expect("fallback after metadata corruption");
-    check!(st.list().iter().any(|e| e.name == "p") && !st.list().iter().any(|e| e.name == "q"), "corrupt metadata image falls back to the previous generation");
+    let st = Store::mount(dev).ok().expect("mount after primary metadata corruption");
+    check!(st.list().iter().any(|e| e.name == "p") && st.list().iter().any(|e| e.name == "q"), "corrupt primary checkpoint image is repaired from its mirror (nothing lost)");
+    // damage the mirror too: both copies of the shared checkpoint are gone, so mount must refuse rather than guess
+    let mut dev = st.into_dev();
+    for slot in [1u64, 1 + crate::store::DIR_SECTORS] {
+        rec.copy_from_slice(&dev.data[slot as usize * 512..slot as usize * 512 + 512]);
+        if u64::from_le_bytes(rec[8..16].try_into().unwrap()) != 3 {
+            continue; // both slots share the checkpoint: damage it once
+        }
+        let m1 = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+        let m2 = u64::from_le_bytes(rec[64..72].try_into().unwrap());
+        let _ = m1; // the primary copy was damaged above and stays damaged
+        if m2 != 0 {
+            dev.data[m2 as usize * 512 + 20] ^= 0x01;
+        }
+    }
+    check!(matches!(Store::mount(dev), Err((StoreErr::Corrupt, _))), "both checkpoint copies damaged -> Corrupt");
+    // a damaged newest log record: fall back to the previous generation
+    let mut st = Store::format(RamDisk::new(2048)).ok().unwrap();
+    st.write("p", b"one").unwrap();
+    st.write("q", b"two").unwrap();
+    let mut dev = st.into_dev();
+    let logstart = u64::from_le_bytes(dev.data[512 + 48..512 + 56].try_into().unwrap()).max(u64::from_le_bytes(dev.data[512 * (1 + crate::store::DIR_SECTORS as usize) + 48..512 * (1 + crate::store::DIR_SECTORS as usize) + 56].try_into().unwrap()));
+    dev.data[(logstart as usize + 1) * 512 + 30] ^= 0x10; // second record (gen 3) payload
+    let st = Store::mount(dev).ok().expect("fallback after log corruption");
+    check!(st.list().iter().any(|e| e.name == "p") && !st.list().iter().any(|e| e.name == "q"), "corrupt newest log record falls back to the previous generation");
     // both root records destroyed -> refuse to mount (never guess)
     let mut dev = st.into_dev();
     dev.data[(1 + crate::store::DIR_SECTORS as usize) * 512 + 40] ^= 0xFF;

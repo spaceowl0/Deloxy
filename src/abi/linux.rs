@@ -125,6 +125,8 @@ fn syscall_inner(f: &mut SyscallFrame) -> i64 {
         21 => sys_access(&p, a0),
         79 => sys_getcwd(&p, a0, a1),
         72 => sys_fcntl(&p, a0, a1, a2),
+        // identity changes: there are no users, so every one of them trivially succeeds (busybox and shells call these)
+        105 | 106 | 113 | 114 | 117 | 119 => 0,
         // process groups and sessions
         111 => super::signals::pgid_of(&p) as i64, // getpgrp
         121 => super::linux_proc::getpgid(&p, a0, false), // getpgid(pid)
@@ -1035,8 +1037,16 @@ fn sys_truncate(p: &Arc<Process>, path: u64, len: u64) -> i64 {
         Err(e) => return -e,
     };
     if let vfs::Data::Buf(v) = &mut f.data {
+        if len as usize > crate::store::MAX_INMEM_BYTES {
+            return -EFBIG;
+        }
         v.resize(len as usize, 0);
         f.dirty = true;
+    } else if let vfs::Data::Pfs(pf) = &mut f.data {
+        return match vfs::pfs_set_len(pf, len) {
+            Ok(()) => 0,
+            Err(e) => -e,
+        };
     } else {
         return -EINVAL;
     }
@@ -1119,6 +1129,28 @@ fn sys_ioctl(p: &Arc<Process>, fd: u64, req: u64, arg: u64) -> i64 {
             Ok(()) => 0,
             Err(e) => -e,
         },
+        0x540F => {
+            // TIOCGPGRP: the console's foreground process group (the caller's own group when nobody claimed it)
+            let fg = crate::tty::foreground();
+            let v = if fg == u64::MAX || fg == 0 { super::signals::pgid_of(p) } else { fg } as u32;
+            match copy_to_user(p, arg, &v.to_le_bytes()) {
+                Ok(()) => 0,
+                Err(_) => -14,
+            }
+        }
+        0x5410 => {
+            // TIOCSPGRP: make a process group the foreground group (tcsetpgrp)
+            let mut b = [0u8; 4];
+            if copy_from_user(p, &mut b, arg).is_err() {
+                return -14;
+            }
+            let g = u32::from_le_bytes(b) as u64;
+            if g == 0 || !crate::task::list_processes().iter().any(|q| !q.has_exited() && super::signals::pgid_of(q) == g) {
+                return -22; // EINVAL
+            }
+            crate::tty::set_foreground(g);
+            0
+        }
         0x5413 => {
             // TIOCGWINSZ: 24 rows x 80 cols
             let mut w = [0u8; 8];
@@ -1203,11 +1235,15 @@ fn sys_ftruncate(p: &Arc<Process>, fd: u64, len: u64) -> i64 {
     let mut g = p.foreign.lock();
     match g.fds.get_mut(i).and_then(|s| s.as_mut()) {
         Some(f) => match &mut f.data {
-            vfs::Data::Buf(b) if (len as usize) <= crate::store::MAX_FILE_BYTES => {
+            vfs::Data::Buf(b) if (len as usize) <= crate::store::MAX_INMEM_BYTES => {
                 b.resize(len as usize, 0);
                 f.dirty = true;
                 0
             }
+            vfs::Data::Pfs(pf) if len <= crate::store::MAX_FILE_BYTES as u64 => match vfs::pfs_set_len(pf, len) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            },
             _ => -EINVAL,
         },
         None => -EBADF,
@@ -1684,12 +1720,19 @@ fn sys_statfs(p: &Arc<Process>, out: u64) -> i64 {
 
 /// sendfile(out, in, *offset, count): copy through a bounce buffer.
 fn sys_sendfile(p: &Arc<Process>, out_fd: u64, in_fd: u64, off_p: u64, count: u64) -> i64 {
+    // stdin/stdout/stderr may be redirected to descriptors (shell redirections, dup2)
+    let (out_fd, in_fd) = (rd(p, out_fd), rd(p, in_fd));
     let count = count.min(1 << 20) as usize;
     let mut tmp = alloc::vec![0u8; count];
     let got = {
         let Some(i) = fd_slot(in_fd) else { return -EBADF };
         let mut g = p.foreign.lock();
         let Some(f) = g.fds.get_mut(i).and_then(|s| s.as_mut()) else { return -EBADF };
+        // like Linux: only seekable, memory-like files can be a sendfile source (pipes, sockets, devices: EINVAL, and
+        // the caller falls back to read/write); `vfs::read` on a pipe would report "no data yet" as end of file
+        if !matches!(f.data, vfs::Data::Buf(_) | vfs::Data::Static(_) | vfs::Data::Shared(_)) {
+            return -22;
+        }
         let save = f.pos;
         if off_p != 0 {
             let mut ob = [0u8; 8];
@@ -1707,7 +1750,16 @@ fn sys_sendfile(p: &Arc<Process>, out_fd: u64, in_fd: u64, off_p: u64, count: u6
         n
     };
     // write through a scratch user buffer is not possible; write via the fd helpers directly
-    let Some(o) = fd_slot(out_fd) else { return got as i64 };
+    let Some(o) = fd_slot(out_fd) else {
+        // fd 1/2 without a redirect: the console
+        if out_fd == 1 || out_fd == 2 {
+            return match console_write(p, "linux", &tmp[..got]) {
+                Ok(()) => got as i64,
+                Err(e) => -e,
+            };
+        }
+        return -EBADF;
+    };
     if super::sock::is_sock(p, o) {
         return match super::sock::send(p, o, &tmp[..got], false) {
             Ok(n) => n as i64,

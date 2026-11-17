@@ -23,6 +23,14 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
         idt.page_fault.set_handler_addr(x86_64::VirtAddr::new(trap_pf as usize as u64));
         idt.general_protection_fault.set_handler_addr(x86_64::VirtAddr::new(trap_gp as usize as u64));
         idt[TIMER_VECTOR].set_handler_addr(x86_64::VirtAddr::new(timer_entry as usize as u64));
+        idt.debug.set_handler_addr(x86_64::VirtAddr::new(trap_db as usize as u64));
+        // int3 from ring 3 needs a DPL-3 gate (otherwise it raises #GP)
+        idt.breakpoint.set_handler_addr(x86_64::VirtAddr::new(trap_bp as usize as u64)).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+        idt.segment_not_present.set_handler_addr(x86_64::VirtAddr::new(trap_np as usize as u64));
+        idt.stack_segment_fault.set_handler_addr(x86_64::VirtAddr::new(trap_ss as usize as u64));
+        idt.x87_floating_point.set_handler_addr(x86_64::VirtAddr::new(trap_mf as usize as u64));
+        idt.alignment_check.set_handler_addr(x86_64::VirtAddr::new(trap_ac as usize as u64));
+        idt.simd_floating_point.set_handler_addr(x86_64::VirtAddr::new(trap_xm as usize as u64));
     }
     // SAFETY: IST index 0 is populated with a valid, dedicated stack in the
     // TSS (see gdt.rs) before the IDT is loaded.
@@ -254,8 +262,111 @@ core::arch::global_asm!(
     rust = sym rust_timer,
 );
 
+// More ring-3 exception stubs: #DB (1), #BP (3), #NP (11), #SS (12), #MF (16), #AC (17), #XM (19). The same scheme as above:
+// ring-0 origin -> a fatal handler, ring-3 origin -> save everything and call `rust_trap`.
+core::arch::global_asm!(
+    ".global trap_db",
+    "trap_db:",
+    "    test byte ptr [rsp + 8], 3",
+    "    jz {k}",
+    "    push 0",
+    "    push 1",
+    "    jmp trap_common",
+    ".global trap_bp",
+    "trap_bp:",
+    "    test byte ptr [rsp + 8], 3",
+    "    jz {k}",
+    "    push 0",
+    "    push 3",
+    "    jmp trap_common",
+    ".global trap_np",
+    "trap_np:",
+    "    test byte ptr [rsp + 16], 3",
+    "    jz {ke}",
+    "    push 11",
+    "    jmp trap_common",
+    ".global trap_ss",
+    "trap_ss:",
+    "    test byte ptr [rsp + 16], 3",
+    "    jz {ke}",
+    "    push 12",
+    "    jmp trap_common",
+    ".global trap_mf",
+    "trap_mf:",
+    "    test byte ptr [rsp + 8], 3",
+    "    jz {k}",
+    "    push 0",
+    "    push 16",
+    "    jmp trap_common",
+    ".global trap_ac",
+    "trap_ac:",
+    "    test byte ptr [rsp + 16], 3",
+    "    jz {ke}",
+    "    push 17",
+    "    jmp trap_common",
+    ".global trap_xm",
+    "trap_xm:",
+    "    test byte ptr [rsp + 8], 3",
+    "    jz {k}",
+    "    push 0",
+    "    push 19",
+    "    jmp trap_common",
+    k = sym unexpected_k,
+    ke = sym unexpected_ke,
+);
+
+extern "x86-interrupt" fn unexpected_k(frame: InterruptStackFrame) {
+    fatal("unexpected exception in the kernel", &frame, None)
+}
+
+extern "x86-interrupt" fn unexpected_ke(frame: InterruptStackFrame, error_code: u64) {
+    fatal("unexpected exception (with error code) in the kernel", &frame, Some(error_code))
+}
+
+/// x87/SSE exception bits that are set *and unmasked* (6 bits: IE DE ZE OE UE PE), or 0.
+fn fpu_unmasked_error(simd: bool) -> u16 {
+    if simd {
+        let mut m: u32 = 0;
+        // SAFETY: stmxcsr stores 4 bytes; SSE is enabled for user mode (CR4.OSFXSR).
+        unsafe { core::arch::asm!("stmxcsr [{}]", in(reg) &mut m, options(nostack)) };
+        ((m & 0x3f) & !((m >> 7) & 0x3f)) as u16
+    } else {
+        let (mut sw, mut cw): (u16, u16) = (0, 0);
+        // SAFETY: fnstsw/fnstcw store 2 bytes; the x87 unit is enabled (CR0.EM = 0).
+        unsafe {
+            core::arch::asm!("fnstsw [{}]", in(reg) &mut sw, options(nostack));
+            core::arch::asm!("fnstcw [{}]", in(reg) &mut cw, options(nostack));
+        }
+        sw & !cw & 0x3f
+    }
+}
+
+/// Linux `si_code` for an FP exception from the unmasked-status bits (as `math_error` does).
+fn fpe_si_code(err: u16) -> i32 {
+    if err & 0x01 != 0 {
+        7 // FPE_FLTINV
+    } else if err & 0x04 != 0 {
+        3 // FPE_FLTDIV
+    } else if err & 0x08 != 0 {
+        4 // FPE_FLTOVF
+    } else if err & 0x12 != 0 {
+        5 // FPE_FLTUND
+    } else if err & 0x20 != 0 {
+        6 // FPE_FLTRES
+    } else {
+        7
+    }
+}
+
 extern "C" {
     fn timer_entry();
+    fn trap_db();
+    fn trap_bp();
+    fn trap_np();
+    fn trap_ss();
+    fn trap_mf();
+    fn trap_ac();
+    fn trap_xm();
     pub fn iret_trapframe(tf: *const TrapFrame) -> !;
     fn trap_de();
     fn trap_ud();
@@ -266,11 +377,21 @@ extern "C" {
 /// Ring-3 fault. Linux processes get SIGFPE/SIGILL/SIGSEGV delivered to their handler when they installed one
 /// (and the signal is not blocked); everything else, and unhandled signals, kill the process as before.
 extern "C" fn rust_trap(tf: &mut TrapFrame) {
-    use crate::sys::errno::EXIT_FAULT_PF;
+    use crate::sys::errno::{EXIT_FAULT_BUS, EXIT_FAULT_PF, EXIT_FAULT_TRAP};
+    let mut fpe_err: u16 = 0;
     let (name, sig, code, addr, exit) = match tf.vector {
         0 => ("divide error (#DE)", 8u64, 1i32, tf.rip, EXIT_FAULT_DE),
+        1 => ("single step / debug (#DB)", 5, 2, tf.rip, EXIT_FAULT_TRAP), // SIGTRAP, TRAP_TRACE
+        3 => ("breakpoint (#BP)", 5, 0x80, tf.rip, EXIT_FAULT_TRAP),       // SIGTRAP, SI_KERNEL
         6 => ("invalid opcode (#UD)", 4, 1, tf.rip, EXIT_FAULT_UD),
+        11 => ("segment not present (#NP)", 7, 0x80, 0, EXIT_FAULT_BUS),   // SIGBUS
+        12 => ("stack segment fault (#SS)", 7, 0x80, 0, EXIT_FAULT_BUS),
         13 => ("general protection (#GP)", 11, 0x80, 0, EXIT_FAULT_GP),
+        16 | 19 => {
+            fpe_err = fpu_unmasked_error(tf.vector == 19);
+            (if tf.vector == 16 { "x87 floating-point error (#MF)" } else { "SIMD floating-point error (#XM)" }, 8, fpe_si_code(fpe_err), tf.rip, EXIT_FAULT_DE)
+        }
+        17 => ("alignment check (#AC)", 7, 1, tf.rip, EXIT_FAULT_BUS),     // SIGBUS, BUS_ADRALN
         _ => {
             let cr2 = Cr2::read_raw();
             // SEGV_ACCERR when the page was present (protection violation), SEGV_MAPERR when it was not mapped
@@ -282,7 +403,7 @@ extern "C" fn rust_trap(tf: &mut TrapFrame) {
     if p.abi() == crate::abi::AbiKind::Linux && crate::abi::signals::deliver_fault(&p, sig, tf, code, addr) {
         return;
     }
-    if p.abi() == crate::abi::AbiKind::Nt && crate::abi::win_exc::deliver_fault(&p, tf, addr, exit) {
+    if p.abi() == crate::abi::AbiKind::Nt && crate::abi::win_exc::deliver_fault(&p, tf, addr, exit, fpe_err) {
         return;
     }
     user_fault_at(name, tf.rip, tf.rsp, detail, exit)

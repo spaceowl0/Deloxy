@@ -259,7 +259,10 @@ pub fn create_thread(p: &Arc<Process>, a: A) -> u64 {
     let sp = stack_top - 64; // 16-aligned; [sp] = start, [sp+8] = param
     let w64 = |off: u64, v: u64| super::super::exec::write_user(p, off, &v.to_le_bytes());
     let peb = NT_DATA_BASE + PAGE_SIZE;
-    let tmpl = p.foreign.lock().tls_tmpl;
+    let (tmpl, dll_tls) = {
+        let g = p.foreign.lock();
+        (g.tls_tmpl, g.tls_dll.clone())
+    };
     let _ = w64(teb + 0x08, stack_top);
     let _ = w64(teb + 0x10, stack_limit);
     let _ = w64(teb + 0x30, teb);
@@ -274,13 +277,27 @@ pub fn create_thread(p: &Arc<Process>, a: A) -> u64 {
             if copy_from_user(p, &mut t, start_va).is_ok() {
                 let _ = super::super::exec::write_user(p, va, &t);
             }
-            let _ = w64(teb + 0x800, va); // this thread's TLS array: [block]
-            let _ = w64(teb + 0x58, teb + 0x800);
+            let _ = w64(teb + 0x800, va); // this thread's TLS array: [exe block, DLL blocks...]
         }
+    }
+    for (idx, start_va, end_va, zero) in dll_tls.iter().copied() {
+        let len = (end_va - start_va) as usize;
+        let pages = (((len + zero as usize) as u64 + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as usize;
+        let va = p.mmap_next.fetch_add((pages as u64 + 1) * PAGE_SIZE, core::sync::atomic::Ordering::SeqCst);
+        if p.map_region(va, pages, crate::mm::vmm::VmFlags::WRITE | crate::mm::vmm::VmFlags::USER).is_ok() {
+            let mut t = alloc::vec![0u8; len];
+            if copy_from_user(p, &mut t, start_va).is_ok() {
+                let _ = super::super::exec::write_user(p, va, &t);
+            }
+            let _ = w64(teb + 0x800 + 8 * idx, va);
+        }
+    }
+    if tmpl.is_some() || !dll_tls.is_empty() {
+        let _ = w64(teb + 0x58, teb + 0x800);
     }
     let _ = w64(sp, start);
     let _ = w64(sp + 8, param);
-    let stub = super::msvcrt::code_stub_addr("<thread_start>").unwrap_or(0);
+    let stub = super::nt::THREAD_START_VA;
     let Some(tid) = task::spawn_user_thread_ex(p, "nthread", stub, sp, 0, teb) else {
         set_err(p, 8);
         return 0;

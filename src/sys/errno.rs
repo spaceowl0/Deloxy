@@ -20,3 +20,5 @@ pub const EXIT_FAULT_PF: i64 = -11;
 pub const EXIT_FAULT_GP: i64 = -12;
 pub const EXIT_FAULT_UD: i64 = -4;
 pub const EXIT_FAULT_DE: i64 = -8;
+pub const EXIT_FAULT_TRAP: i64 = -5; // SIGTRAP
+pub const EXIT_FAULT_BUS: i64 = -7; // SIGBUS

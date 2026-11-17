@@ -245,6 +245,7 @@ pub fn plan(d: &[u8]) -> Result<Plan, ExecError> {
         modules: Vec::new(),
         dll_init: Vec::new(),
         exe_info: (0, 0, 0),
+        tls_cbs: Vec::new(),
     })
 }
 

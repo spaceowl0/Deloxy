@@ -15,6 +15,7 @@ pub mod winmath;
 pub mod winsock;
 pub mod win_extra;
 pub mod win_exc;
+pub mod nt_stubs;
 pub mod win32_thr;
 pub mod nt;
 pub mod sock;
@@ -72,6 +73,9 @@ pub struct ForeignState {
     /// PE: SizeOfImage and exception directory (rva, bytes) of the executable; the SEH runtime's frame dispatcher
     pub exe_info: (u64, u32, u32),
     pub seh_dispatch: u64,
+    /// PE: implicit TLS of the DLLs: (tls index, template start, end, zero-fill); the executable is index 0 (`tls_tmpl`)
+    pub tls_dll: alloc::vec::Vec<(u64, u64, u64, u32)>,
+    pub exe_tls_cbs: alloc::vec::Vec<u64>,
     /// process group / session ids (0 = the process's own pid: a program started by the shell leads its own group and session)
     pub pgid: u64,
     pub sid: u64,
@@ -214,6 +218,8 @@ impl ForeignState {
         self.ueh = 0;
         self.seh_dispatch = 0;
         self.exe_info = (0, 0, 0);
+        self.tls_dll.clear();
+        self.exe_tls_cbs.clear();
         self.brk_base_hint = 0;
         self.brk_base = 0;
         self.brk = 0;
@@ -258,6 +264,8 @@ impl ForeignState {
             pending_init: false,
             exe_info: (0, 0, 0),
             seh_dispatch: 0,
+            tls_dll: alloc::vec::Vec::new(),
+            exe_tls_cbs: alloc::vec::Vec::new(),
             pgid: 0,
             sid: 0,
             stopped: false,
@@ -348,6 +356,16 @@ pub const STDIN_INTR: i64 = -0x5151;
 pub fn stdin_read(p: &Arc<Process>, max: usize) -> Result<alloc::vec::Vec<u8>, i64> {
     if p.foreign.lock().console == 0 {
         return Err(EBADF);
+    }
+    // job control: a Linux program that is not in the foreground group must not read the terminal (SIGTTIN stops it;
+    // the read restarts after SIGCONT; if the signal is ignored/blocked the read reports end of file)
+    if p.abi() == AbiKind::Linux {
+        let fg = crate::tty::foreground();
+        let pg = signals::pgid_of(p);
+        if fg != u64::MAX && pg != fg {
+            signals::signal_group(pg, signals::SIGTTIN);
+            return if p.foreign.lock().stopped { Err(STDIN_INTR) } else { Err(5) };
+        }
     }
     {
         let mut f = p.foreign.lock();

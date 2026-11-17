@@ -24,6 +24,7 @@ use crate::mm::vmm::VmFlags;
 use crate::task::Process;
 
 pub const ERROR_MOD_NOT_FOUND: u32 = 126;
+pub const ERROR_NOT_SUPPORTED: u32 = 50;
 pub const ERROR_PROC_NOT_FOUND: u32 = 127;
 pub const ERROR_BAD_EXE_FORMAT: u32 = 193;
 pub const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
@@ -211,6 +212,11 @@ pub fn load_library(p: &Arc<Process>, path: &str) -> Result<u64, u32> {
     };
     let _ = root;
     for (i, dp) in ctx.mods.iter().enumerate() {
+        if dp.module.tls.is_some() {
+            // existing threads would have no TLS block for it (as on Windows before Vista): only DLLs present at startup may use it
+            log::warn!("LoadLibrary({}): {} uses implicit TLS, which is only supported for DLLs linked at startup", path, dp.module.name);
+            return Err(ERROR_NOT_SUPPORTED);
+        }
         let reuse = forced.is_some() && dp.module.name == name;
         if let Err(e) = map_dll_plan(p, dp, reuse) {
             log::warn!("LoadLibrary({}): mapping failed: {}", path, e);
@@ -230,6 +236,7 @@ pub fn load_library(p: &Arc<Process>, path: &str) -> Result<u64, u32> {
         }
         g.dll_next = g.dll_next.max(ctx.next_base);
     }
+    nt::write_notify_list(p);
     if queue_calls(p, &calls).is_err() {
         return Err(ERROR_NOT_ENOUGH_MEMORY);
     }
@@ -252,6 +259,7 @@ pub fn free_library(p: &Arc<Process>, h: u64) -> bool {
         m.attached = false;
         (m.entry != 0).then_some((m.entry, m.base, 0u32))
     };
+    nt::write_notify_list(p);
     if let Some(c) = call {
         let _ = queue_calls(p, &[c]);
     }

@@ -98,7 +98,7 @@ pub fn init() {
     Star::write(s.user_code, s.user_data, s.kernel_code, s.kernel_data)
         .expect("GDT layout incompatible with SYSRET");
     LStar::write(VirtAddr::new(syscall_entry as usize as u64));
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
+    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK);
     // SAFETY: enabling SCE only makes the SYSCALL instruction legal; LSTAR/STAR are set above.
     unsafe { Efer::update(|f| f.insert(EferFlags::SYSTEM_CALL_EXTENSIONS)) };
 }

@@ -100,6 +100,8 @@ pub struct Plan {
     pub dll_init: Vec<(u64, u64)>,
     /// PE executable: SizeOfImage and exception directory (rva, bytes); zeros for ELF
     pub exe_info: (u64, u32, u32),
+    /// PE executable: its TLS callbacks (called like DllMain, with the image base as module)
+    pub tls_cbs: Vec<u64>,
 }
 
 /// Where the dynamic linker is mapped (between the program and the mmap area).
@@ -359,6 +361,7 @@ fn build_into(proc: Arc<Process>, name: &str, data: &[u8], main_len: usize, plan
         let mut f = proc.foreign.lock();
         f.image_base = plan.image_base;
         f.exe_info = plan.exe_info;
+        f.exe_tls_cbs = plan.tls_cbs.clone();
         f.brk_base = brk_base;
         f.brk = brk_base;
         f.brk_mapped = brk_base;
@@ -444,7 +447,15 @@ fn unsafe_words(h: &[u64]) -> Vec<u8> {
 
 /// Build + start. Returns the new process.
 pub fn spawn(name: &str, data: &[u8], opts: &SpawnOpts) -> Result<Arc<Process>, ExecError> {
+    spawn_hooked(name, data, opts, |_| Ok(()))
+}
+
+/// Like `spawn`, but `hook` runs on the finished process *before* its first thread exists (so on any number of CPUs
+/// the child cannot observe a half-configured state): used to wire stdio and process groups. An error from the hook
+/// aborts the spawn (the process is dropped without ever running).
+pub fn spawn_hooked(name: &str, data: &[u8], opts: &SpawnOpts, hook: impl FnOnce(&Arc<Process>) -> Result<(), ExecError>) -> Result<Arc<Process>, ExecError> {
     let b = build(name, data, opts)?;
+    hook(&b.proc)?;
     crate::audit_log!(crate::audit::EV_PROC_SPAWN, 0, 0, b.proc.pid, b.proc.abi() as u8, 0);
     task::spawn_user_thread_ex(&b.proc, name, b.rip, b.rsp, b.arg0, b.gs).ok_or(ExecError::OutOfMemory)?;
     Ok(b.proc)

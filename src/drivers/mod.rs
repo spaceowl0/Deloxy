@@ -1,5 +1,6 @@
 pub mod blk;
 pub mod fb;
+pub mod gpu;
 pub mod input;
 pub mod serial;
 pub mod usb;

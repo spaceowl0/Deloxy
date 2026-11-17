@@ -56,6 +56,7 @@ impl FbInfo {
                 }
             }
         }
+        crate::drivers::gpu::flush(x, y, w, h);
     }
 
     /// Fill a rectangle directly on screen.
