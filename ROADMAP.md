@@ -335,6 +335,10 @@ Exit criteria:
 - [x] P15  writable hierarchical persistent filesystem (DeloxyStore v2: dirs, symlinks, modes, atomic rename, multi-extent files, crash-safe COW commits, v1 migration; `/store`, `/home`, `/var`... for Linux, Win32 and the shell)
 - [x] P16  Windows DLL loading (static imports of DLL files, ordinals, forwarders, dependency chains, relocation, `DllMain` via user-mode stubs, LoadLibrary/GetProcAddress/FreeLibrary with reload)
 - [x] P17  CPU faults as signals (SIGSEGV/SIGFPE/SIGILL with siginfo, `sigaltstack`, restart after handler, default/ignored/blocked = kill)
+- [x] P29  Epilogue-aware unwinding, RtlAddFunctionTable, DLL thread/process notifications, implicit TLS in DLLs, TLS callbacks (`win_unwind2/win_nx/win_tls`)
+- [x] P28  CPU exceptions as signals: int3/single-step/x87 (SSE and #AC implemented but unverifiable under QEMU TCG), Windows breakpoint/single-step/FP codes (`linux_traps`, `win_traps`)
+- [x] P27  Shell pipelines and redirection, bundled busybox, spawn-with-stdio syscall, sendfile fixes (`tools/compat-test.py` pipes block)
+- [x] P26  Shell job control: `run &`, jobs/fg/bg/kill, Ctrl-Z, terminal foreground group, SIGTTIN, tcsetpgrp (`tools/compat-test.py` job checks)
 - [x] P25  Table-based Windows SEH: `.pdata` unwinder runtime (`deloxy_seh.dll`), RtlUnwindEx, `__C_specific_handler`, mingw C++ exceptions (`user/poc/win_cpp.cc`, `win_unwind.c`, `win_scope.c`)
 - [x] P24  Process groups/sessions, group kill/wait, SIGSTOP/SIGTSTP/SIGCONT + WUNTRACED/WCONTINUED, Ctrl-C to the foreground program (`user/poc/linux_jobs.c`)
 - [x] P23  Interruptible console reads (partial line survives) and `connect` (`user/poc/linux_tty.c`)
@@ -343,11 +347,27 @@ Exit criteria:
 - [x] P20  Windows exception dispatch: vectored handlers, `SetUnhandledExceptionFilter`, `RaiseException`, real EXCEPTION_RECORD/CONTEXT with resume (`abi/win_exc.rs`, `user/poc/win_seh.c`)
 - [x] P19  Asynchronous signal delivery on timer interrupts (full-register frames, `iret_trapframe`), `getppid` fixed; `user/poc/linux_async.c`
 - [x] P18  Files app browses the hierarchical store (folders, `..`, Backspace, New folder, Delete for empty folders; `tools/files-test.py` 25 checks)
-0. SIGBUS/SIGTRAP/FP exceptions, controlling-terminal job control (`tcsetpgrp`, SIGTTIN/SIGTTOU, Ctrl-Z and `jobs/fg/bg` in deloxy-sh; groups, stop/continue and Ctrl-C are done in P24), `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
-0b. Windows: epilogue-aware unwinding, unwind info v2, `RtlAddFunctionTable`, clang/MSVC-built SEH test programs, libstdc++-6.dll/libgcc_s_seh-1.dll dynamic linking, DLL thread notifications + TLS, delay-load imports, process-exit `DLL_PROCESS_DETACH`.
+0. SIGTTOU/orphaned groups/SIGHUP (job table, Ctrl-Z, foreground group, SIGTTIN, tcsetpgrp: P24/P26; pipelines/redirection: P27; SIGTRAP/FP/SIGBUS: P28), shell variables/`;`/`&&`/globbing/here-documents, `/proc/<pid>/fd`, store: hard links/`statfs`, growing extents in place, a journal for multi-file transactions.
+0b. Windows: unwind info v2, clang/MSVC-built SEH test programs, libstdc++-6.dll/libgcc_s_seh-1.dll dynamic linking, TLS callbacks of dynamically loaded DLLs, JIT (needs the permission design S13), delay-load imports, process-exit `DLL_PROCESS_DETACH`.
 (old item, now done) **Crypto-quality entropy** (`getrandom`, RDSEED/RDRAND + virtio-rng + jitter pool) so ported TLS stacks are safe; then ship a TLS-capable sample (mbedTLS/BearSSL static) as a test program.
 2. **Floating point in the shim ABI** (xmm0/xmm1 args and returns for Windows, math functions, `%f`/`atof`), needed by most real applications.
 3. USB: external hubs, mass storage (bulk transfers, then a read-only FAT driver), then audio class. NVMe driver. e1000e / virtio-gpu / UEFI GOP resize.
 4. Linux: fork/execve, AF_UNIX sockets (socketpair), signals, timerfd/signalfd/inotify, `/proc` basics, dynamic linking (ld.so) for non-static binaries.
 5. Windows: user32/gdi32 windowing mapped onto deloxy-de, structured exception handling, COM basics.
 6. Real-hardware bring-up pass for the new drivers (see HANDOFF 9l).
+
+### Strategic roadmap (from docs/RESEARCH_2026-11.md; effort S=1 session ... XL = not realistic without a team/hardware)
+- [~] S1  virtio-gpu 2D driver (DONE: scanout 0, dirty-rect flush, desktop 81/81 on virtio-vga; TODO: runtime resolution change, cursor plane, interrupts instead of polling)
+- [ ] S2  fast software compositing: SSE/AVX blits, damage tracking, double buffering (S-M)
+- [ ] S3  `/dev/fb0` + key/mouse input for Linux programs (M)
+- [ ] S4  DOOM via doomgeneric once S3 exists (S); in-house deloxy-de games (S each)
+- [ ] S5  audio: Intel HDA / virtio-snd output + mixer (M-L)
+- [ ] S6  SDL2 software backend (L) - unlocks many open-source 2D games
+- [ ] S7  package manager: signed manifests, TUF-style repository metadata, atomic install, permission review; then a Store app (M-L)
+- [ ] S8  NVMe and USB mass storage drivers (M each, testable in QEMU)
+- [ ] S9  filesystem: multi-file journal, fsck/scrub, snapshots, encryption at rest, read-only FAT/ext4 (M-L)
+- [ ] S10 SMP (L-XL; audit every single-CPU assumption first)
+- [ ] S11 browser: NetSurf first (M-L), Firefox/Chromium-class not realistic yet
+- [ ] S12 real-hardware test matrix + serial/USB debug path (needs hardware access)
+- [ ] S13 per-application `jit` permission (RW->RX flips only) for JIT-based software
+- [ ] S14 Intel display-only mode setting (L per generation, blind without hardware); AMD/NVIDIA 3D drivers: not realistic

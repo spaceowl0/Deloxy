@@ -7,6 +7,7 @@ smoltcp (0BSD), ed25519-compact (MIT), sha2 (MIT/Apache-2.0) and their dependenc
 user/blobs/ contains prebuilt TEST binaries and shared libraries that are third-party software redistributed unmodified or linked into test programs. Their sources are not part of this repository; obtain them from the upstream projects:
   - Ubuntu GNU C Library 2.39 (libc.so.6, libm.so.6, ld-linux-x86-64.so.2, libnss_*.so.2): LGPL-2.1-or-later. Many linux_*.elf test programs are statically linked against glibc; their own sources are in user/poc/ so they can be relinked.
   - GCC runtime libraries (libstdc++.so.6, libgcc_s.so.1): GPL-3.0-or-later with the GCC Runtime Library Exception.
+  - BusyBox (user/blobs/busybox, Ubuntu `busybox-static`, unmodified): GPL-2.0-only. Corresponding source: https://busybox.net/ and the Ubuntu source package `busybox`; if you redistribute an ISO containing it you must offer that source (a written offer or a link to the exact version is sufficient).
   - OpenSSL 3.x (statically linked into linux_tls.elf): Apache-2.0.
   - MinGW-w64 runtime and import libraries (linked into win_*.exe / *.dll): mostly public domain / ZPL-2.1 / MIT-style; see the mingw-w64 project.
 user/seh/deloxy_seh.c is part of Deloxy (its `unwind code` interpretation follows the public x64 unwind-info format documented by Microsoft and the algorithms used by the Wine and ReactOS projects, re-implemented from the specification, not copied).
